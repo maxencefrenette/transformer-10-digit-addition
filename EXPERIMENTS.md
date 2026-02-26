@@ -752,3 +752,66 @@ uv run python evaluate_checkpoints.py \
     - aggregate exact `0.09949` (90,051 errors / 100,000)
 - Conclusion:
   - This clean 4-trainable/2-fixed `A` split for positional embeddings underperformed strongly on this setup (0/3 successful seeds).
+
+### Experiment E24: `EmbeddingsXsLora` (LoRA-XS-Style Positional Embedding, Random Fixed Factors, `r=16`, 3 seeds)
+- Goal:
+  - Add a dedicated positional embedding module inspired by LoRA-XS where only a small square matrix is trainable.
+  - Use fully random fixed factors (no SVD init) and no fixed full-rank positional embedding addend.
+- Code change:
+  - `src/model.py`:
+    - Added `pos_xs_rank` to `ModelConfig`.
+    - Added new module `EmbeddingsXsLora`:
+      - fixed non-trainable `B_fixed` of shape `(33, r)`
+      - trainable `R` of shape `(r, r)`
+      - fixed non-trainable `A_fixed` of shape `(r, d_model)`
+      - positional embedding computed as `B_fixed[idx] @ R @ A_fixed`
+    - `TinyDecoderLM` uses `EmbeddingsXsLora` when `pos_xs_rank > 0`.
+  - `src/train.py`:
+    - Added CLI flag `--pos-xs-rank`.
+    - Added guard so `--pos-rank` and `--pos-xs-rank` cannot both be enabled.
+  - `evaluate_checkpoints.py`:
+    - Added `pos_xs_rank` to emitted config metadata.
+- Setup:
+  - `n_layer=1`, `d_model=8`, `d_ff=28`, `n_head=1`
+  - `pos_rank=0`, `pos_xs_rank=16`, `qkv_rank=0`, `attn_out_rank=0`, `ffn_rank=3`
+  - `fixed_full_rank=true` for linear layers, `lr=0.015`, `train_steps=30000`, `device=mps`, `eval_interval=500`
+  - seeds: `42`, `43`, `44`
+- Parameter note:
+  - Total parameters: `888` (close to baseline; trainable positional matrix is `R` with `16x16=256` params vs `33x8=264` in full learned positional embedding).
+- Commands (pattern):
+```bash
+uv run python -m src.train \
+  --run-name posxs16_fixed1_ffnr3_s{SEED}_30k \
+  --n-layer 1 --d-model 8 --d-ff 28 \
+  --pos-rank 0 --pos-xs-rank 16 \
+  --qkv-rank 0 --attn-out-rank 0 --ffn-rank 3 \
+  --fixed-full-rank \
+  --lr 0.015 --train-steps 30000 --seed {SEED} --device mps --eval-interval 500
+
+uv run python evaluate_checkpoints.py \
+  results/runs/posxs16_fixed1_ffnr3_s{SEED}_30k/checkpoints/best.pt \
+  --device mps --output results/posxs16_fixed1_ffnr3_s{SEED}_30k_eval.json
+```
+- Outputs:
+  - `results/runs/posxs16_fixed1_ffnr3_s42_30k/summary.json`
+  - `results/runs/posxs16_fixed1_ffnr3_s43_30k/summary.json`
+  - `results/runs/posxs16_fixed1_ffnr3_s44_30k/summary.json`
+  - `results/posxs16_fixed1_ffnr3_s42_30k_eval.json`
+  - `results/posxs16_fixed1_ffnr3_s43_30k_eval.json`
+  - `results/posxs16_fixed1_ffnr3_s44_30k_eval.json`
+  - W&B runs:
+    - `maxence-frenette/transformer-10-digit-addition/runs/l12siwlw`
+    - `maxence-frenette/transformer-10-digit-addition/runs/u2eh9xd6`
+    - `maxence-frenette/transformer-10-digit-addition/runs/6hzu9lrh`
+- Findings:
+  - Seed 42:
+    - `best_val_exact=0.0` (step `0`)
+    - aggregate exact `0.0` (100,000 errors / 100,000)
+  - Seed 43:
+    - `best_val_exact=0.0` (step `0`)
+    - aggregate exact `0.0` (100,000 errors / 100,000)
+  - Seed 44:
+    - `best_val_exact=0.0` (step `0`)
+    - aggregate exact `0.0` (100,000 errors / 100,000)
+- Conclusion:
+  - This randomized LoRA-XS-style positional embedding (`r=16`) failed on all 3 seeds in the current training setup.
