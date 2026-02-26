@@ -639,3 +639,56 @@ uv run python evaluate_checkpoints.py \
     - aggregate exact `0.99986` (14 errors / 100,000)
 - Conclusion:
   - `pos_rank=6` can reach near-perfect performance, but remains seed-sensitive in this setup (2 strong seeds, 1 partial-failure seed).
+
+### Experiment E22: `pos_rank=6` with Fixed Full-Rank Term Also Applied to Low-Rank Positional Embeddings (3 seeds)
+- Goal:
+  - Re-run the `pos_rank=6` setting, but extend `fixed_full_rank` behavior to `LowRankEmbedding` (not only `LowRankLinear`).
+- Code change:
+  - `src/model.py`:
+    - `LowRankEmbedding` now accepts `fixed_full_rank`.
+    - Added non-trainable buffer `W_fixed` in `LowRankEmbedding`.
+    - Forward path now uses: `A[idx] @ B + W_fixed[idx]` when `fixed_full_rank=true`.
+    - `TinyDecoderLM` now passes `fixed_full_rank=cfg.fixed_full_rank` when constructing low-rank positional embeddings.
+- Setup:
+  - `n_layer=1`, `d_model=8`, `d_ff=28`, `n_head=1`
+  - `pos_rank=6`, `qkv_rank=0`, `attn_out_rank=0`, `ffn_rank=3`
+  - `fixed_full_rank=true`, `lr=0.015`, `train_steps=30000`, `device=mps`, `eval_interval=500`
+  - seeds: `42`, `43`, `44`
+- Commands (pattern):
+```bash
+uv run python -m src.train \
+  --run-name posrank6_embfixed_fixed1_ffnr3_s{SEED}_30k \
+  --n-layer 1 --d-model 8 --d-ff 28 \
+  --pos-rank 6 --qkv-rank 0 --attn-out-rank 0 --ffn-rank 3 \
+  --fixed-full-rank \
+  --lr 0.015 --train-steps 30000 --seed {SEED} --device mps --eval-interval 500
+
+uv run python evaluate_checkpoints.py \
+  results/runs/posrank6_embfixed_fixed1_ffnr3_s{SEED}_30k/checkpoints/best.pt \
+  --device mps --output results/posrank6_embfixed_fixed1_ffnr3_s{SEED}_30k_eval.json
+```
+- Outputs:
+  - `results/runs/posrank6_embfixed_fixed1_ffnr3_s42_30k/summary.json`
+  - `results/runs/posrank6_embfixed_fixed1_ffnr3_s43_30k/summary.json`
+  - `results/runs/posrank6_embfixed_fixed1_ffnr3_s44_30k/summary.json`
+  - `results/posrank6_embfixed_fixed1_ffnr3_s42_30k_eval.json`
+  - `results/posrank6_embfixed_fixed1_ffnr3_s43_30k_eval.json`
+  - `results/posrank6_embfixed_fixed1_ffnr3_s44_30k_eval.json`
+  - W&B runs:
+    - `maxence-frenette/transformer-10-digit-addition/runs/d0lqkh92`
+    - `maxence-frenette/transformer-10-digit-addition/runs/irizk0oi`
+    - `maxence-frenette/transformer-10-digit-addition/runs/0ct2fv0a`
+- Findings:
+  - All runs used `878` parameters.
+  - Seed 42:
+    - `best_val_exact=0.0082` (step `28500`)
+    - aggregate exact `0.00655` (99,345 errors / 100,000)
+  - Seed 43:
+    - `best_val_exact=0.0` (step `0`)
+    - aggregate exact `0.0` (100,000 errors / 100,000)
+  - Seed 44:
+    - `best_val_exact=0.1080` (step `29999`)
+    - aggregate exact `0.10881` (89,119 errors / 100,000)
+- Conclusion:
+  - Applying the fixed full-rank residual to low-rank positional embeddings significantly degraded this `pos_rank=6` setup on all 3 seeds.
+  - Compared with E21 (same hyperparameters except this embedding change), performance regressed from 2/3 near-perfect seeds to 0/3 successful seeds.
