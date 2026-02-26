@@ -815,3 +815,194 @@ uv run python evaluate_checkpoints.py \
     - aggregate exact `0.0` (100,000 errors / 100,000)
 - Conclusion:
   - This randomized LoRA-XS-style positional embedding (`r=16`) failed on all 3 seeds in the current training setup.
+
+### Experiment E25: Add `grad_norm` Logging
+- Goal:
+  - Track gradient norm for every evaluation point to diagnose optimization stability.
+- Code change:
+  - `src/train.py`:
+    - Compute grad norm each step via `torch.nn.utils.clip_grad_norm_`.
+    - Add `grad_norm` column to `results/runs/*/metrics.csv`.
+    - Print `grad_norm` in step logs.
+    - Log `optim/grad_norm` to W&B.
+- Command:
+```bash
+uv run python -m src.train \
+  --run-name smoke_gradnorm_log \
+  --train-steps 1 --eval-interval 1 \
+  --batch-size 16 --val-size 64 --test-size 64 --eval-batch-size 32 \
+  --device cpu --wandb false
+```
+- Outputs:
+  - `results/runs/smoke_gradnorm_log/metrics.csv`
+  - `results/runs/smoke_gradnorm_log/summary.json`
+- Findings:
+  - `metrics.csv` now includes `grad_norm`.
+  - Console and W&B metrics include gradient norm without changing model shape (`896` params).
+
+### Experiment E26: LR/WD/Warmup Retune `tune_fastlr1` (3 seeds)
+- Goal:
+  - Improve time-to-99% by using a more aggressive schedule on the 896-parameter baseline.
+- Setup:
+  - `n_layer=1`, `d_model=8`, `d_ff=28`, `ffn_rank=3`, `fixed_full_rank=true`
+  - `batch_size=512`, `lr=0.02`, `weight_decay=0.005`, `warmup_steps=500`, `min_lr_ratio=0.2`
+  - `train_steps=30000`, `eval_interval=500`, seeds `42/43/44`
+- Command (pattern):
+```bash
+uv run python -m src.train \
+  --run-name tune_fastlr1_s{SEED}_30k \
+  --n-layer 1 --d-model 8 --d-ff 28 \
+  --pos-rank 0 --qkv-rank 0 --attn-out-rank 0 --ffn-rank 3 \
+  --fixed-full-rank \
+  --batch-size 512 --lr 0.02 --weight-decay 0.005 \
+  --warmup-steps 500 --min-lr-ratio 0.2 \
+  --train-steps 30000 --seed {SEED} --device mps --eval-interval 500
+```
+- Outputs:
+  - `results/runs/tune_fastlr1_s42_30k/summary.json`
+  - `results/runs/tune_fastlr1_s43_30k/summary.json`
+  - `results/runs/tune_fastlr1_s44_30k/summary.json`
+  - W&B runs:
+    - `maxence-frenette/transformer-10-digit-addition/runs/yc0bjcv3`
+    - `maxence-frenette/transformer-10-digit-addition/runs/ct4anphs`
+    - `maxence-frenette/transformer-10-digit-addition/runs/ouqboulz`
+- Findings:
+  - Seed 42: `best_val_exact=0.1136` (step `21500`)
+  - Seed 43: `best_val_exact=0.4586` (step `27500`)
+  - Seed 44: `best_val_exact=0.0128` (step `27500`)
+- Conclusion:
+  - Failed stability constraint (`0/3` seeds reached `>=0.99`).
+
+### Experiment E27: LR/WD/Warmup Retune `tune_stable1` (3 seeds)
+- Goal:
+  - Test a less aggressive variant after `tune_fastlr1`.
+- Setup:
+  - Same model shape (`896` params)
+  - `batch_size=512`, `lr=0.015`, `weight_decay=0.01`, `warmup_steps=800`, `min_lr_ratio=0.2`
+  - `train_steps=30000`, seeds `42/43/44`
+- Command (pattern):
+```bash
+uv run python -m src.train \
+  --run-name tune_stable1_s{SEED}_30k \
+  --n-layer 1 --d-model 8 --d-ff 28 \
+  --pos-rank 0 --qkv-rank 0 --attn-out-rank 0 --ffn-rank 3 \
+  --fixed-full-rank \
+  --batch-size 512 --lr 0.015 --weight-decay 0.01 \
+  --warmup-steps 800 --min-lr-ratio 0.2 \
+  --train-steps 30000 --seed {SEED} --device mps --eval-interval 500
+```
+- Outputs:
+  - `results/runs/tune_stable1_s42_30k/summary.json`
+  - `results/runs/tune_stable1_s43_30k/summary.json`
+  - `results/runs/tune_stable1_s44_30k/summary.json`
+  - W&B runs:
+    - `maxence-frenette/transformer-10-digit-addition/runs/qmiw8tgt`
+    - `maxence-frenette/transformer-10-digit-addition/runs/dhdx4tgj`
+    - `maxence-frenette/transformer-10-digit-addition/runs/rmc8it54`
+- Findings:
+  - Seed 42: `best_val_exact=0.0986` (step `29999`)
+  - Seed 43: `best_val_exact=0.0012` (step `29000`)
+  - Seed 44: `best_val_exact=0.0002` (step `27000`)
+- Conclusion:
+  - Failed stability constraint (`0/3` seeds reached `>=0.99`).
+
+### Experiment E28: Warmup Sweep `tune_warmup1000` (3 seeds)
+- Goal:
+  - Recover baseline behavior by moving warmup to `1000` and `min_lr_ratio=0.1`.
+- Setup:
+  - Same model shape (`896` params)
+  - `batch_size=512`, `lr=0.015`, `weight_decay=0.01`, `warmup_steps=1000`, `min_lr_ratio=0.1`
+  - `train_steps=30000`, seeds `42/43/44`
+- Command (pattern):
+```bash
+uv run python -m src.train \
+  --run-name tune_warmup1000_s{SEED}_30k \
+  --n-layer 1 --d-model 8 --d-ff 28 \
+  --pos-rank 0 --qkv-rank 0 --attn-out-rank 0 --ffn-rank 3 \
+  --fixed-full-rank \
+  --batch-size 512 --lr 0.015 --weight-decay 0.01 \
+  --warmup-steps 1000 --min-lr-ratio 0.1 \
+  --train-steps 30000 --seed {SEED} --device mps --eval-interval 500
+```
+- Outputs:
+  - `results/runs/tune_warmup1000_s42_30k/summary.json`
+  - `results/runs/tune_warmup1000_s43_30k/summary.json`
+  - `results/runs/tune_warmup1000_s44_30k/summary.json`
+  - W&B runs:
+    - `maxence-frenette/transformer-10-digit-addition/runs/cgxh6jvf`
+    - `maxence-frenette/transformer-10-digit-addition/runs/zafn5ilm`
+    - `maxence-frenette/transformer-10-digit-addition/runs/mpyc4vo0`
+- Findings:
+  - Seed 42: `best_val_exact=0.9872` (step `29500`) [near miss]
+  - Seed 43: `best_val_exact=0.0` (step `0`)
+  - Seed 44: `best_val_exact=0.0154` (step `27500`)
+- Conclusion:
+  - Failed stability constraint (`0/3` seeds reached `>=0.99`).
+
+### Experiment E29: Higher Batch Size `1024` (`tune_bs1024_lr015`, 3 seeds)
+- Goal:
+  - Test whether higher batch size improves wall-clock time-to-99%.
+- Setup:
+  - Same model shape (`896` params)
+  - `batch_size=1024`, `lr=0.015`, `weight_decay=0.01`, `warmup_steps=1350`, `min_lr_ratio=0.1`
+  - `train_steps=30000`, seeds `42/43/44`
+- Command (pattern):
+```bash
+uv run python -m src.train \
+  --run-name tune_bs1024_lr015_s{SEED}_30k \
+  --n-layer 1 --d-model 8 --d-ff 28 \
+  --pos-rank 0 --qkv-rank 0 --attn-out-rank 0 --ffn-rank 3 \
+  --fixed-full-rank \
+  --batch-size 1024 --lr 0.015 --weight-decay 0.01 \
+  --warmup-steps 1350 --min-lr-ratio 0.1 \
+  --train-steps 30000 --seed {SEED} --device mps --eval-interval 500
+```
+- Outputs:
+  - `results/runs/tune_bs1024_lr015_s42_30k/summary.json`
+  - `results/runs/tune_bs1024_lr015_s43_30k/summary.json`
+  - `results/runs/tune_bs1024_lr015_s44_30k/summary.json`
+  - W&B runs:
+    - `maxence-frenette/transformer-10-digit-addition/runs/ceahzy62`
+    - `maxence-frenette/transformer-10-digit-addition/runs/s63zjc45`
+    - `maxence-frenette/transformer-10-digit-addition/runs/j0vy20nt`
+- Findings:
+  - Seed 42: `best_val_exact=0.0016` (step `29500`)
+  - Seed 43: `best_val_exact=0.0` (step `0`)
+  - Seed 44: `best_val_exact=0.1082` (step `13000`)
+- Conclusion:
+  - Failed stability constraint (`0/3` seeds reached `>=0.99`).
+  - Also slower per-step wall clock than `batch_size=512`.
+
+### Experiment E30: Higher Batch Size `768` (`tune_bs768_lr015`, 3 seeds)
+- Goal:
+  - Try a milder batch-size increase after `1024` failure.
+- Setup:
+  - Same model shape (`896` params)
+  - `batch_size=768`, `lr=0.015`, `weight_decay=0.01`, `warmup_steps=1350`, `min_lr_ratio=0.1`
+  - `train_steps=30000`, seeds `42/43/44`
+- Command (pattern):
+```bash
+uv run python -m src.train \
+  --run-name tune_bs768_lr015_s{SEED}_30k \
+  --n-layer 1 --d-model 8 --d-ff 28 \
+  --pos-rank 0 --qkv-rank 0 --attn-out-rank 0 --ffn-rank 3 \
+  --fixed-full-rank \
+  --batch-size 768 --lr 0.015 --weight-decay 0.01 \
+  --warmup-steps 1350 --min-lr-ratio 0.1 \
+  --train-steps 30000 --seed {SEED} --device mps --eval-interval 500
+```
+- Outputs:
+  - `results/runs/tune_bs768_lr015_s42_30k/summary.json`
+  - `results/runs/tune_bs768_lr015_s43_30k/summary.json`
+  - `results/runs/tune_bs768_lr015_s44_30k/summary.json`
+  - W&B runs:
+    - `maxence-frenette/transformer-10-digit-addition/runs/rbh4e277`
+    - `maxence-frenette/transformer-10-digit-addition/runs/pzuz5ryq`
+    - `maxence-frenette/transformer-10-digit-addition/runs/4249p23t`
+- Findings:
+  - Seed 42: `best_val_exact=0.0754` (step `29999`)
+  - Seed 43: `best_val_exact=1.0` (step `13500`), first `>=0.99` at step `13000` (`156.3s`)
+  - Seed 44: `best_val_exact=0.4558` (step `29999`)
+- Conclusion:
+  - Failed stability constraint (`1/3` seeds reached `>=0.99`).
+  - Despite one fast seed, variance is too high for reliable time-to-99 optimization.

@@ -202,7 +202,7 @@ def train(model_cfg: ModelConfig, train_cfg: TrainConfig) -> Dict:
     )
 
     save_csv_header(metrics_path,
-                    ["step", "train_loss", "val_exact", "val_token_acc", "lr", "elapsed_sec"])
+                    ["step", "train_loss", "val_exact", "val_token_acc", "grad_norm", "lr", "elapsed_sec"])
 
     best_val = -1.0
     best_step = -1
@@ -246,6 +246,7 @@ def train(model_cfg: ModelConfig, train_cfg: TrainConfig) -> Dict:
         model.train()
         x, y = sampler.sample_batch(step)
         x, y = x.to(device), y.to(device)
+        grad_norm = float("nan")
 
         lr_now = cosine_lr(step, train_cfg.train_steps, train_cfg.lr,
                            train_cfg.warmup_steps, train_cfg.min_lr_ratio)
@@ -259,20 +260,20 @@ def train(model_cfg: ModelConfig, train_cfg: TrainConfig) -> Dict:
             if scaler is not None:
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
-                if train_cfg.grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg.grad_clip)
+                clip_max_norm = train_cfg.grad_clip if train_cfg.grad_clip > 0 else float("inf")
+                grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), clip_max_norm))
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 loss.backward()
-                if train_cfg.grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg.grad_clip)
+                clip_max_norm = train_cfg.grad_clip if train_cfg.grad_clip > 0 else float("inf")
+                grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), clip_max_norm))
                 optimizer.step()
         else:
             _, loss = model(x, y)
             loss.backward()
-            if train_cfg.grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg.grad_clip)
+            clip_max_norm = train_cfg.grad_clip if train_cfg.grad_clip > 0 else float("inf")
+            grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), clip_max_norm))
             optimizer.step()
 
         if (step % train_cfg.eval_interval == 0) or (step == train_cfg.train_steps - 1):
@@ -281,10 +282,10 @@ def train(model_cfg: ModelConfig, train_cfg: TrainConfig) -> Dict:
             )
             elapsed = time.time() - t0
             train_loss = float(loss.item())
-            append_csv(metrics_path, [step, train_loss, val_exact, val_tok, lr_now, elapsed])
+            append_csv(metrics_path, [step, train_loss, val_exact, val_tok, grad_norm, lr_now, elapsed])
             print(
                 f"step={step:6d} loss={train_loss:.4f} val_exact={val_exact:.4f} "
-                f"val_tok={val_tok:.5f} lr={lr_now:.2e} t={elapsed:.1f}s"
+                f"val_tok={val_tok:.5f} grad_norm={grad_norm:.4f} lr={lr_now:.2e} t={elapsed:.1f}s"
             )
             if wandb_run is not None:
                 wandb_run.log(
@@ -292,6 +293,7 @@ def train(model_cfg: ModelConfig, train_cfg: TrainConfig) -> Dict:
                         "train/loss": train_loss,
                         "val/exact_match": val_exact,
                         "val/token_acc": val_tok,
+                        "optim/grad_norm": grad_norm,
                         "optim/lr": lr_now,
                         "time/elapsed_sec": elapsed,
                     },
