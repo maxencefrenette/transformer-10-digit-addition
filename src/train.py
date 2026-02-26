@@ -18,7 +18,7 @@ import random
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
@@ -62,6 +62,9 @@ class TrainConfig:
     last_ckpt_out: str
     device: str
     dtype: str = "fp32"  # fp32, fp16, bf16
+    wandb: bool = True
+    wandb_project: str = "maxence-frenette/transformer-10-digit-addition"
+    wandb_mode: str = "online"
     # Curriculum phases: list of (min_digits, max_digits, steps)
     curriculum: str = ""  # serialized; parsed below
 
@@ -150,6 +153,19 @@ def append_csv(path: Path, row: List) -> None:
         csv.writer(f).writerow(row)
 
 
+def parse_wandb_project_path(value: str) -> Tuple[Optional[str], str]:
+    """Accept either 'project' or 'entity/project'."""
+    path = value.strip()
+    if not path:
+        raise ValueError("W&B project path cannot be empty")
+    if "/" not in path:
+        return None, path
+    entity, project = path.split("/", 1)
+    if not entity or not project:
+        raise ValueError(f"Invalid W&B project path: '{value}'")
+    return entity, project
+
+
 def train(model_cfg: ModelConfig, train_cfg: TrainConfig) -> Dict:
     device = torch.device(train_cfg.device)
     dtype = DTYPE_MAP.get(train_cfg.dtype, torch.float32)
@@ -203,6 +219,30 @@ def train(model_cfg: ModelConfig, train_cfg: TrainConfig) -> Dict:
     print(f"Device: {device}, amp_dtype: {dtype}, use_amp: {use_amp}, scaler: {use_scaler}")
     print(f"Curriculum: {CURRICULUM_PHASES}")
 
+    wandb_run = None
+    if train_cfg.wandb and train_cfg.wandb_mode != "disabled":
+        try:
+            import wandb
+
+            entity, project = parse_wandb_project_path(train_cfg.wandb_project)
+            wandb_init = {
+                "project": project,
+                "name": train_cfg.run_name,
+                "mode": train_cfg.wandb_mode,
+                "config": {
+                    "model": asdict(model_cfg),
+                    "train": asdict(train_cfg),
+                    "curriculum_phases": CURRICULUM_PHASES,
+                    "params": params,
+                },
+            }
+            if entity is not None:
+                wandb_init["entity"] = entity
+            wandb_run = wandb.init(**wandb_init)
+            print(f"W&B: logging to {train_cfg.wandb_project} (mode={train_cfg.wandb_mode})")
+        except Exception as exc:
+            print(f"W&B: disabled ({exc})")
+
     for step in range(train_cfg.train_steps):
         model.train()
         x, y = sampler.sample_batch(step)
@@ -247,6 +287,17 @@ def train(model_cfg: ModelConfig, train_cfg: TrainConfig) -> Dict:
                 f"step={step:6d} loss={train_loss:.4f} val_exact={val_exact:.4f} "
                 f"val_tok={val_tok:.5f} lr={lr_now:.2e} t={elapsed:.1f}s"
             )
+            if wandb_run is not None:
+                wandb_run.log(
+                    {
+                        "train/loss": train_loss,
+                        "val/exact_match": val_exact,
+                        "val/token_acc": val_tok,
+                        "optim/lr": lr_now,
+                        "time/elapsed_sec": elapsed,
+                    },
+                    step=step,
+                )
 
             if val_exact > best_val:
                 best_val = val_exact
@@ -263,6 +314,9 @@ def train(model_cfg: ModelConfig, train_cfg: TrainConfig) -> Dict:
                     },
                     train_cfg.best_ckpt_out,
                 )
+                if wandb_run is not None:
+                    wandb_run.summary["best_val_exact"] = best_val
+                    wandb_run.summary["best_step"] = best_step
 
     Path(train_cfg.last_ckpt_out).parent.mkdir(parents=True, exist_ok=True)
     torch.save(
@@ -288,6 +342,11 @@ def train(model_cfg: ModelConfig, train_cfg: TrainConfig) -> Dict:
     }
     save_json(run_dir / "summary.json", summary)
     save_json(run_dir / "config.json", {"model": asdict(model_cfg), "train": asdict(train_cfg)})
+    if wandb_run is not None:
+        wandb_run.summary["final_val_exact"] = summary["best_val_exact"]
+        wandb_run.summary["final_best_step"] = summary["best_step"]
+        wandb_run.summary["elapsed_sec"] = summary["elapsed_sec"]
+        wandb_run.finish()
     return summary
 
 
@@ -302,6 +361,14 @@ def main() -> None:
     p.add_argument("--dtype", type=str, default="fp32", choices=["fp32", "fp16", "bf16"],
                    help="Training precision (fp32, fp16, bf16)")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--wandb", action=argparse.BooleanOptionalAction, default=True,
+                   help="Enable Weights & Biases logging")
+    p.add_argument("--wandb-project", type=str,
+                   default="maxence-frenette/transformer-10-digit-addition",
+                   help="W&B project path: 'entity/project' or 'project'")
+    p.add_argument("--wandb-mode", type=str, default="online",
+                   choices=["online", "offline", "disabled"],
+                   help="W&B logging mode")
 
     # model (gpt-acc-jax defaults)
     p.add_argument("--n-layer", type=int, default=1)
@@ -380,6 +447,9 @@ def main() -> None:
         last_ckpt_out=str(run_dir / "checkpoints" / "last.pt"),
         device=args.device,
         dtype=args.dtype,
+        wandb=args.wandb,
+        wandb_project=args.wandb_project,
+        wandb_mode=args.wandb_mode,
     )
 
     summary = train(model_cfg, train_cfg)

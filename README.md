@@ -64,6 +64,9 @@ Evaluated on 10 independent test sets of 10,000 examples each (100,000 total), w
 uv sync
 ```
 
+Training runs auto-log to Weights & Biases at `maxence-frenette/transformer-10-digit-addition`.
+Use `--no-wandb` to disable logging for a run.
+
 ### Evaluate Pre-trained Checkpoint
 
 ```bash
