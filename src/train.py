@@ -664,10 +664,16 @@ def main() -> None:
     p.add_argument("--attn-out-rank", type=int, default=0, help="Attn output rank (0=full)")
     p.add_argument("--ffn-rank", type=int, default=3, help="FFN rank (0=full)")
     p.add_argument(
-        "--fixed-full-rank",
+        "--fixed-full-rank-attn",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Add fixed full-rank random term to low-rank linear layers",
+        help="Add fixed full-rank random term in attention low-rank linear layers",
+    )
+    p.add_argument(
+        "--fixed-full-rank-mlp",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Add fixed full-rank random term in MLP low-rank linear layers",
     )
 
     # optimization (gpt-acc-jax defaults)
@@ -701,7 +707,8 @@ def main() -> None:
         qkv_rank=args.qkv_rank,
         attn_out_rank=args.attn_out_rank,
         ffn_rank=args.ffn_rank,
-        fixed_full_rank=args.fixed_full_rank,
+        fixed_full_rank_attn=args.fixed_full_rank_attn,
+        fixed_full_rank_mlp=args.fixed_full_rank_mlp,
         num_models=args.num_models,
     )
 

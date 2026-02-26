@@ -25,7 +25,8 @@ class ModelConfig:
     qkv_rank: int = 0
     attn_out_rank: int = 0
     ffn_rank: int = 3
-    fixed_full_rank: bool = True
+    fixed_full_rank_attn: bool = True
+    fixed_full_rank_mlp: bool = True
     # Number of independent models trained in parallel.
     num_models: int = 8
 
@@ -264,7 +265,7 @@ class Block(nn.Module):
             cfg.max_seq_len,
             qkv_rank=cfg.qkv_rank,
             attn_out_rank=cfg.attn_out_rank,
-            fixed_full_rank=cfg.fixed_full_rank,
+            fixed_full_rank=cfg.fixed_full_rank_attn,
         )
         self.ln2 = ModelLayerNorm(cfg.num_models, cfg.d_model)
         self.mlp = MLP(
@@ -272,7 +273,7 @@ class Block(nn.Module):
             cfg.d_model,
             cfg.d_ff,
             ffn_rank=cfg.ffn_rank,
-            fixed_full_rank=cfg.fixed_full_rank,
+            fixed_full_rank=cfg.fixed_full_rank_mlp,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -377,40 +378,6 @@ class TinyDecoderLM(nn.Module):
         if return_per_model_loss:
             return logits, loss, per_model_loss
         return logits, loss
-
-    def load_state_dict(self, state_dict, strict: bool = True):
-        """Load checkpoints with backward compatibility for pre-model-axis weights."""
-        target_state = self.state_dict()
-        adapted = {}
-        for key, value in state_dict.items():
-            if key not in target_state or not torch.is_tensor(value):
-                adapted[key] = value
-                continue
-
-            target = target_state[key]
-            if value.shape == target.shape:
-                adapted[key] = value
-                continue
-
-            # Legacy single-model checkpoints may omit the model axis.
-            if target.dim() == 3 and value.dim() == 2 and target.shape[0] == 1:
-                if value.shape == target.shape[1:]:
-                    adapted[key] = value.unsqueeze(0)
-                    continue
-                # Legacy nn.Linear stored weights as [out, in]. New full-rank path
-                # stores [m, in, out], so transpose if needed.
-                if value.t().shape == target.shape[1:]:
-                    adapted[key] = value.t().unsqueeze(0)
-                    continue
-
-            if target.dim() == 2 and value.dim() == 1 and target.shape[0] == 1:
-                if value.shape == target.shape[1:]:
-                    adapted[key] = value.unsqueeze(0)
-                    continue
-
-            adapted[key] = value
-
-        return super().load_state_dict(adapted, strict=strict)
 
     @torch.no_grad()
     def generate(self, prompt: torch.Tensor, max_new_tokens: int) -> torch.Tensor:

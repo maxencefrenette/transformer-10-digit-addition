@@ -35,6 +35,7 @@ Current code path: single-layer, single-head, decoder-only transformer with voca
 | Attention QKV | Full-rank linear or low-rank factorized linear (`qkv_rank`) |
 | Attention output | Full-rank linear or low-rank factorized linear (`attn_out_rank`) |
 | FFN up/down | Full-rank linear or low-rank factorized linear (`ffn_rank`) |
+| Fixed full-rank residual term | Configurable independently for attention (`fixed_full_rank_attn`) and MLP (`fixed_full_rank_mlp`) low-rank layers |
 | Normalization | `LayerNorm` |
 
 Reference parameter counts in current code:
