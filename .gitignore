@@ -9,6 +9,7 @@ build/
 # Training artifacts (large, reproducible)
 results/runs/
 results/data/
+results/*_eval.json
 
 # LaTeX auxiliary files
 *.aux
