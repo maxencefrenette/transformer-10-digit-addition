@@ -129,3 +129,4 @@ report.pdf               # Technical report
 - D. Papailiopoulos, "Glove box challenge: smallest transformer for 10-digit addition," 2026. [GitHub](https://github.com/anadim/smallest-addition-transformer-codex)
 - Y. Havinga, "gpt-acc-jax: Smallest GPT for 10-digit addition," 2026. [GitHub](https://github.com/yhavinga/gpt-acc-jax)
 - rezabyt, "digit-addition-491p," 2026. [GitHub](https://github.com/rezabyt/digit-addition-491p)
+- yinglunz, "A-456-Parameter-Transformer-Solves-10-Digit-Addition," 2026. [GitHub](https://github.com/yinglunz/A-456-Parameter-Transformer-Solves-10-Digit-Addition)
