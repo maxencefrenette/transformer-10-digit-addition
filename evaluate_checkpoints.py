@@ -76,6 +76,7 @@ def main():
             "qkv_rank": cfg.qkv_rank,
             "attn_out_rank": cfg.attn_out_rank,
             "ffn_rank": cfg.ffn_rank,
+            "fixed_full_rank": cfg.fixed_full_rank,
             "vocab_size": cfg.vocab_size,
             "max_seq_len": cfg.max_seq_len,
             "weight_tying": tied,

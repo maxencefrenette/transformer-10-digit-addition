@@ -12,16 +12,17 @@ import torch.nn.functional as F
 @dataclass
 class ModelConfig:
     n_layer: int = 1
-    d_model: int = 7
+    d_model: int = 8
     n_head: int = 1
-    d_ff: int = 14
+    d_ff: int = 28
     max_seq_len: int = 33   # 22 prompt + 11 target digits
     vocab_size: int = 14    # 0-9, +, =, <PAD>, <EOS>
     # Optional low-rank factors (0 = full rank)
     pos_rank: int = 0
     qkv_rank: int = 0
     attn_out_rank: int = 0
-    ffn_rank: int = 0
+    ffn_rank: int = 3
+    fixed_full_rank: bool = True
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> "ModelConfig":
@@ -31,17 +32,30 @@ class ModelConfig:
 
 
 class LowRankLinear(nn.Module):
-    """y = x @ A @ B (no bias). Params: in_f*r + r*out_f."""
+    """y = x @ A @ B (+ fixed full-rank term, optional), no bias."""
 
-    def __init__(self, in_features: int, out_features: int, rank: int):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        rank: int,
+        fixed_full_rank: bool = False,
+    ):
         super().__init__()
+        self.fixed_full_rank = fixed_full_rank
         self.A = nn.Parameter(torch.empty(in_features, rank))
         self.B = nn.Parameter(torch.empty(rank, out_features))
         nn.init.normal_(self.A, std=math.sqrt(2.0 / (in_features + rank)))
         nn.init.normal_(self.B, std=math.sqrt(2.0 / (rank + out_features)))
+        # Always keep this buffer for checkpoint compatibility; usage is gated.
+        self.register_buffer("W_fixed", torch.empty(in_features, out_features))
+        nn.init.normal_(self.W_fixed, mean=0.0, std=0.02)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x @ self.A @ self.B
+        y = x @ self.A @ self.B
+        if self.fixed_full_rank:
+            y = y + x @ self.W_fixed
+        return y
 
 
 class LowRankEmbedding(nn.Module):
@@ -66,6 +80,7 @@ class CausalSelfAttention(nn.Module):
         max_seq_len: int,
         qkv_rank: int = 0,
         attn_out_rank: int = 0,
+        fixed_full_rank: bool = False,
     ):
         super().__init__()
         assert d_model % n_head == 0
@@ -73,12 +88,16 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = d_model // n_head
 
         if qkv_rank > 0:
-            self.qkv = LowRankLinear(d_model, 3 * d_model, qkv_rank)
+            self.qkv = LowRankLinear(
+                d_model, 3 * d_model, qkv_rank, fixed_full_rank=fixed_full_rank
+            )
         else:
             self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
 
         if attn_out_rank > 0:
-            self.proj = LowRankLinear(d_model, d_model, attn_out_rank)
+            self.proj = LowRankLinear(
+                d_model, d_model, attn_out_rank, fixed_full_rank=fixed_full_rank
+            )
         else:
             self.proj = nn.Linear(d_model, d_model, bias=False)
 
@@ -104,11 +123,21 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, d_model: int, d_ff: int, ffn_rank: int = 0):
+    def __init__(
+        self,
+        d_model: int,
+        d_ff: int,
+        ffn_rank: int = 0,
+        fixed_full_rank: bool = False,
+    ):
         super().__init__()
         if ffn_rank > 0:
-            self.fc1 = LowRankLinear(d_model, d_ff, ffn_rank)
-            self.fc2 = LowRankLinear(d_ff, d_model, ffn_rank)
+            self.fc1 = LowRankLinear(
+                d_model, d_ff, ffn_rank, fixed_full_rank=fixed_full_rank
+            )
+            self.fc2 = LowRankLinear(
+                d_ff, d_model, ffn_rank, fixed_full_rank=fixed_full_rank
+            )
         else:
             self.fc1 = nn.Linear(d_model, d_ff, bias=False)
             self.fc2 = nn.Linear(d_ff, d_model, bias=False)
@@ -127,9 +156,15 @@ class Block(nn.Module):
             cfg.max_seq_len,
             qkv_rank=cfg.qkv_rank,
             attn_out_rank=cfg.attn_out_rank,
+            fixed_full_rank=cfg.fixed_full_rank,
         )
         self.ln2 = nn.LayerNorm(cfg.d_model)
-        self.mlp = MLP(cfg.d_model, cfg.d_ff, ffn_rank=cfg.ffn_rank)
+        self.mlp = MLP(
+            cfg.d_model,
+            cfg.d_ff,
+            ffn_rank=cfg.ffn_rank,
+            fixed_full_rank=cfg.fixed_full_rank,
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x + self.attn(self.ln1(x))

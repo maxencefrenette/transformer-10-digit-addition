@@ -354,3 +354,152 @@ uv run python evaluate_checkpoints.py \
   - Shared-2 best was `lr=0.012` with aggregate exact `0.97991`; `lr=0.015` degraded to `0.32465`.
   - Regular 1-layer reaches near-perfect performance at both `lr=0.012` and `lr=0.015`.
   - In this sweep, the high-performing LR region is larger for `n_layer=1` than for `n_layer=2`.
+
+### Experiment E16: Fixed Full-Rank Random Residual in `LowRankLinear`
+- Goal:
+  - Add a non-trainable full-rank random matrix to each `LowRankLinear` and test whether low-rank training improves.
+- Code change:
+  - `LowRankLinear` now computes `x @ A @ B + x @ W_fixed`, where `W_fixed` is a buffer (non-trainable).
+  - Trainable parameter counts are unchanged; only fixed buffer tensors were added.
+- Parameter sanity check:
+```bash
+uv run python - <<'PY'
+from src.model import ModelConfig, TinyDecoderLM, count_parameters
+cfg = ModelConfig(
+    n_layer=1, d_model=7, n_head=1, d_ff=14,
+    max_seq_len=33, vocab_size=14,
+    pos_rank=3, qkv_rank=3, attn_out_rank=3, ffn_rank=3,
+)
+m = TinyDecoderLM(cfg)
+print('trainable_params', count_parameters(m))
+print('buffer_params', sum(b.numel() for _, b in m.named_buffers()))
+PY
+```
+  - Output: `trainable_params=512`, `buffer_params=1481`.
+- Smoke command:
+```bash
+uv run python -m src.train \
+  --run-name smoke_lowrank_fixedfullrank \
+  --train-steps 2 --eval-interval 1 \
+  --batch-size 8 --val-size 16 --test-size 16 --eval-batch-size 16 \
+  --device cpu --wandb --wandb-mode disabled \
+  --d-model 7 --d-ff 14 \
+  --pos-rank 3 --qkv-rank 3 --attn-out-rank 3 --ffn-rank 3
+```
+- Main training command:
+```bash
+uv run python -m src.train \
+  --run-name lowrank_fixedfullrank_512_s42_27k \
+  --n-layer 1 --d-model 7 --d-ff 14 \
+  --pos-rank 3 --qkv-rank 3 --attn-out-rank 3 --ffn-rank 3 \
+  --train-steps 27000 --seed 42 --device mps --eval-interval 500
+```
+- Evaluation command:
+```bash
+uv run python evaluate_checkpoints.py \
+  results/runs/lowrank_fixedfullrank_512_s42_27k/checkpoints/best.pt \
+  --device mps --output results/lowrank_fixedfullrank_512_s42_27k_eval.json
+```
+- Outputs:
+  - `results/runs/lowrank_fixedfullrank_512_s42_27k/summary.json`
+  - `results/runs/lowrank_fixedfullrank_512_s42_27k/metrics.csv`
+  - `results/runs/lowrank_fixedfullrank_512_s42_27k/checkpoints/best.pt`
+  - `results/lowrank_fixedfullrank_512_s42_27k_eval.json`
+  - W&B run: `maxence-frenette/transformer-10-digit-addition/runs/bczb65jd`
+- Findings:
+  - Training reached `best_val_exact=1.0` at step `18000`.
+  - Multi-seed aggregate exact match: `1.0` (0 errors / 100,000).
+  - On this run, adding fixed full-rank random residuals to low-rank layers produced a strong, fully-correct 100k evaluation.
+
+### Experiment E17: Fixed Full-Rank Residual Robustness Check (Additional Seeds)
+- Goal:
+  - Re-run the same fixed-full-rank low-rank configuration with two additional seeds.
+- Config:
+  - `n_layer=1`, `d_model=7`, `d_ff=14`, `pos_rank=3`, `qkv_rank=3`, `attn_out_rank=3`, `ffn_rank=3`, `train_steps=27000`, `device=mps`.
+- Commands:
+```bash
+uv run python -m src.train \
+  --run-name lowrank_fixedfullrank_512_s43_27k \
+  --n-layer 1 --d-model 7 --d-ff 14 \
+  --pos-rank 3 --qkv-rank 3 --attn-out-rank 3 --ffn-rank 3 \
+  --train-steps 27000 --seed 43 --device mps --eval-interval 500
+
+uv run python -m src.train \
+  --run-name lowrank_fixedfullrank_512_s44_27k \
+  --n-layer 1 --d-model 7 --d-ff 14 \
+  --pos-rank 3 --qkv-rank 3 --attn-out-rank 3 --ffn-rank 3 \
+  --train-steps 27000 --seed 44 --device mps --eval-interval 500
+
+uv run python evaluate_checkpoints.py \
+  results/runs/lowrank_fixedfullrank_512_s43_27k/checkpoints/best.pt \
+  --device mps --output results/lowrank_fixedfullrank_512_s43_27k_eval.json
+
+uv run python evaluate_checkpoints.py \
+  results/runs/lowrank_fixedfullrank_512_s44_27k/checkpoints/best.pt \
+  --device mps --output results/lowrank_fixedfullrank_512_s44_27k_eval.json
+```
+- Outputs:
+  - `results/runs/lowrank_fixedfullrank_512_s43_27k/summary.json`
+  - `results/runs/lowrank_fixedfullrank_512_s44_27k/summary.json`
+  - `results/lowrank_fixedfullrank_512_s43_27k_eval.json`
+  - `results/lowrank_fixedfullrank_512_s44_27k_eval.json`
+  - W&B runs:
+    - `maxence-frenette/transformer-10-digit-addition/runs/0t5gpfhr`
+    - `maxence-frenette/transformer-10-digit-addition/runs/ntiyhj9r`
+- Findings:
+  - Seed 43:
+    - `best_val_exact=0.0` (step 0)
+    - aggregate exact `0.0` (100,000 errors / 100,000)
+  - Seed 44:
+    - `best_val_exact=0.0` (step 0)
+    - aggregate exact `0.0` (100,000 errors / 100,000)
+  - Combined with seed 42 from E16:
+    - seed 42: aggregate exact `1.0` (0 errors)
+    - seeds 43/44: aggregate exact `0.0` (complete failure)
+- Conclusion:
+  - The fixed full-rank residual modification is extremely seed-sensitive in current form on this hardware; the seed-42 success does not generalize to these additional seeds.
+
+### Experiment E18: `fixed_full_rank` Toggle as Hyperparameter (6 Runs, `ffn_rank=3`)
+- Goal:
+  - Compare `fixed_full_rank=false` vs `fixed_full_rank=true` across 3 seeds each (6 runs total), with `ffn_rank=3`.
+- Code updates:
+  - Added `fixed_full_rank` to `ModelConfig`.
+  - Added CLI flag: `--fixed-full-rank/--no-fixed-full-rank`.
+  - `LowRankLinear` now gates the fixed matrix contribution by this flag.
+  - Included `fixed_full_rank` in `evaluate_checkpoints.py` output metadata.
+- Shared training setup:
+  - `n_layer=1`, `d_model=8`, `d_ff=28`, `n_head=1`
+  - `pos_rank=0`, `qkv_rank=0`, `attn_out_rank=0`, `ffn_rank=3`
+  - `lr=0.015`, `train_steps=30000`, `device=mps`, `eval_interval=500`
+  - seeds: `42`, `43`, `44`
+- Commands (pattern):
+```bash
+uv run python -m src.train \
+  --run-name ffnr3_fixed{0|1}_s{SEED}_30k \
+  --n-layer 1 --d-model 8 --d-ff 28 \
+  --pos-rank 0 --qkv-rank 0 --attn-out-rank 0 --ffn-rank 3 \
+  --no-fixed-full-rank|--fixed-full-rank \
+  --lr 0.015 --train-steps 30000 --seed {SEED} --device mps --eval-interval 500
+
+uv run python evaluate_checkpoints.py \
+  results/runs/ffnr3_fixed{0|1}_s{SEED}_30k/checkpoints/best.pt \
+  --device mps --output results/ffnr3_fixed{0|1}_s{SEED}_30k_eval.json
+```
+- Per-run results:
+  - `ffnr3_fixed0_s42_30k`: `best_val_exact=0.0000`, aggregate exact `0.00000` (100,000 errors)
+  - `ffnr3_fixed0_s43_30k`: `best_val_exact=0.0180`, aggregate exact `0.01374` (98,626 errors)
+  - `ffnr3_fixed0_s44_30k`: `best_val_exact=0.0004`, aggregate exact `0.00012` (99,988 errors)
+  - `ffnr3_fixed1_s42_30k`: `best_val_exact=1.0000`, aggregate exact `0.99998` (2 errors)
+  - `ffnr3_fixed1_s43_30k`: `best_val_exact=1.0000`, aggregate exact `0.99996` (4 errors)
+  - `ffnr3_fixed1_s44_30k`: `best_val_exact=1.0000`, aggregate exact `0.99999` (1 error)
+- Grouped comparison:
+  - `fixed_full_rank=false`:
+    - mean best validation exact: `0.00613`
+    - mean aggregate exact: `0.00462`
+    - mean aggregate errors: `99,538`
+  - `fixed_full_rank=true`:
+    - mean best validation exact: `1.00000`
+    - mean aggregate exact: `0.99998`
+    - mean aggregate errors: `2.33`
+- Conclusion:
+  - For this `ffn_rank=3` setup, enabling `fixed_full_rank` is decisively better and robust across all three tested seeds.

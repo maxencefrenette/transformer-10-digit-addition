@@ -371,25 +371,31 @@ def main() -> None:
 
     # model (gpt-acc-jax defaults)
     p.add_argument("--n-layer", type=int, default=1)
-    p.add_argument("--d-model", type=int, default=7)
+    p.add_argument("--d-model", type=int, default=8)
     p.add_argument("--n-head", type=int, default=1)
-    p.add_argument("--d-ff", type=int, default=14)
+    p.add_argument("--d-ff", type=int, default=28)
     # low-rank options
     p.add_argument("--pos-rank", type=int, default=0, help="Position embedding rank (0=full)")
     p.add_argument("--qkv-rank", type=int, default=0, help="QKV projection rank (0=full)")
     p.add_argument("--attn-out-rank", type=int, default=0, help="Attn output rank (0=full)")
-    p.add_argument("--ffn-rank", type=int, default=0, help="FFN rank (0=full)")
+    p.add_argument("--ffn-rank", type=int, default=3, help="FFN rank (0=full)")
+    p.add_argument(
+        "--fixed-full-rank",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Add fixed full-rank random term to low-rank linear layers",
+    )
 
 
     # optimization (gpt-acc-jax defaults)
-    p.add_argument("--train-steps", type=int, default=27000)
+    p.add_argument("--train-steps", type=int, default=30000)
     p.add_argument("--batch-size", type=int, default=512)
-    p.add_argument("--lr", type=float, default=0.02)
+    p.add_argument("--lr", type=float, default=0.015)
     p.add_argument("--weight-decay", type=float, default=0.01)
     p.add_argument("--warmup-steps", type=int, default=1350)
     p.add_argument("--min-lr-ratio", type=float, default=0.1)
     p.add_argument("--grad-clip", type=float, default=1.0)
-    p.add_argument("--eval-interval", type=int, default=1000)
+    p.add_argument("--eval-interval", type=int, default=500)
 
     # eval
     p.add_argument("--val-size", type=int, default=5000)
@@ -412,6 +418,7 @@ def main() -> None:
         qkv_rank=args.qkv_rank,
         attn_out_rank=args.attn_out_rank,
         ffn_rank=args.ffn_rank,
+        fixed_full_rank=args.fixed_full_rank,
     )
 
     run_dir = Path(args.run_dir)
