@@ -53,6 +53,30 @@
 ```
 - Finding: Passes fully on this machine. Aggregate exact match `1.0` (0/100,000 errors).
 
+### Experiment E5: 512p Baseline Training Reproduction (Seed 42)
+- Command:
+```bash
+uv run python -m src.train \
+  --run-name repro_512_s42_mps \
+  --pos-rank 3 --qkv-rank 3 --attn-out-rank 3 --ffn-rank 3 \
+  --train-steps 27000 --seed 42 --device mps
+```
+- Outputs:
+  - `results/runs/repro_512_s42_mps/summary.json`
+  - `results/runs/repro_512_s42_mps/metrics.csv`
+- Finding: Did not grok. `best_val_exact = 0.0` after 27,000 steps.
+
+### Experiment E6: 512p Evaluation (Reproduced vs Provided Checkpoint)
+- Commands:
+```bash
+uv run python evaluate_checkpoints.py results/runs/repro_512_s42_mps/checkpoints/last.pt --device mps --output results/repro_512_s42_mps_eval.json
+uv run python evaluate_checkpoints.py checkpoints/best_512params.pt --device mps --output results/reference_512_eval.json
+```
+- Findings:
+  - Reproduced checkpoint: `results/repro_512_s42_mps_eval.json` aggregate exact match `0.0` (100,000/100,000 errors).
+  - Provided checkpoint: `results/reference_512_eval.json` aggregate exact match `0.99988` (12/100,000 errors), matching the repo baseline.
+
 ### Conclusion
 - Reproduction training attempts with seeds 43 and 44 on `mps` did not reproduce the published 100% result.
 - Evaluation pipeline is valid locally (provided checkpoint reproduces expected 100%).
+- 512-parameter baseline training also failed to reproduce on `mps`, while the provided 512 checkpoint evaluates as expected.
