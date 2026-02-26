@@ -61,20 +61,20 @@ Evaluated on 10 independent test sets of 10,000 examples each (100,000 total), w
 ### Install
 
 ```bash
-pip install torch==2.10.0
+uv sync
 ```
 
 ### Evaluate Pre-trained Checkpoint
 
 ```bash
-python evaluate_checkpoints.py \
+uv run python evaluate_checkpoints.py \
   checkpoints/best_456p_s43.pt --device cuda
 ```
 
 ### Single Prediction
 
 ```bash
-python -m src.eval predict \
+uv run python -m src.eval predict \
   --ckpt checkpoints/best_456p_s43.pt \
   --a 1234567890 --b 9876543210
 ```
@@ -83,14 +83,14 @@ python -m src.eval predict \
 
 ```bash
 # 456-param model (best: seed 43)
-python -m src.train \
+uv run python -m src.train \
   --run-name best_456 \
   --pos-rank 3 --qkv-rank 3 --attn-out-rank 2 --ffn-rank 3 \
   --use-rmsnorm --tie-qkv shareA_tieKV \
-  --total-steps 54000 --device cuda --seed 43
+  --train-steps 54000 --device cuda --seed 43
 
 # 512-param model
-python -m src.train \
+uv run python -m src.train \
   --run-name best_512 \
   --pos-rank 3 --qkv-rank 3 --attn-out-rank 3 --ffn-rank 3 \
   --device cuda --seed 42
