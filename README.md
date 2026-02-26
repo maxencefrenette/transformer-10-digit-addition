@@ -3,6 +3,7 @@
 A **456-parameter** transformer that solves 10-digit integer addition. Given two integers A, B in [0, 10^10), the model predicts C = A + B autoregressively, achieving **100% exact-match accuracy** on 100,000 test examples.
 
 Current code focus: baseline transformer with optional rank factorization (`pos_rank`, `qkv_rank`, `attn_out_rank`, `ffn_rank`). The model path uses LayerNorm and standard QKV projections (full-rank or low-rank), with only embedding/output weight tying supported.
+The training code also supports vectorized parallel training of multiple independent models via `--num-models`.
 
 The repo also includes historical results from earlier variants explored in the ecosystem (including RMSNorm and QKV-tying ideas), but those are not part of the current trainable code path.
 
@@ -97,6 +98,27 @@ uv run python -m src.train \
   --train-steps 54000 --device cuda --seed 42
 ```
 
+### Parallel Multi-Model Training
+
+```bash
+# Train 3 independent models in one vectorized run (seeds: 42, 43, 44)
+uv run python -m src.train \
+  --run-name parallel3_d8 \
+  --num-models 3 \
+  --d-model 8 --d-ff 28 \
+  --train-steps 30000 --device mps --seed 42
+```
+
+Behavior:
+- Public naming uses `num_models`; internal tensor docs may refer to the model axis as `m`.
+- Model `i` uses seed `seed + i`.
+- Training writes per-model checkpoints and metrics under:
+  - `results/runs/<run_name>/model_000/`
+  - `results/runs/<run_name>/model_001/`
+  - ...
+- A root aggregate summary is written to `results/runs/<run_name>/summary.json`.
+- W&B logs one run per model (`<run_name>_model000`, etc.) grouped under `<run_name>`.
+
 ## Training
 
 3-phase curriculum following [gpt-acc-jax](https://github.com/yhavinga/gpt-acc-jax):
@@ -112,12 +134,14 @@ All successful models exhibit **grokking**: prolonged near-zero accuracy followe
 
 ```
 src/
-  model.py    # Baseline transformer with optional rank factorization
+  model.py    # Baseline transformer with optional rank factorization and model-axis support
   data.py     # Raw digit tokenization pipeline
-  train.py    # Training with curriculum learning
+  train.py    # Training with curriculum learning (+ vectorized multi-model mode)
   eval.py     # Evaluation and inference
 results/runs/<run_name>/checkpoints/
   best.pt / last.pt   # Runtime checkpoints written by training
+results/runs/<run_name>/model_000/checkpoints/
+  best.pt / last.pt   # Per-model checkpoints when --num-models > 1
 evaluate_checkpoints.py  # Multi-seed evaluation script
 report.pdf               # Technical report
 ```

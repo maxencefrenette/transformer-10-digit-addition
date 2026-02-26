@@ -10,3 +10,9 @@
 
 ## Experiment Execution
 - Always run 3 seeds for every experiment by default.
+
+## Multi-Model Default
+- Use `num_models=8` by default unless explicitly overridden.
+
+## Experiment Success Criterion
+- Standard success criterion: at least 4 of the 8 models must converge to `>99%` validation exact-match accuracy.

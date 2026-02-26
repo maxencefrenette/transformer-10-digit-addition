@@ -16,9 +16,9 @@ import json
 import math
 import random
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import torch
 
@@ -29,7 +29,7 @@ from src.data import (
     encode_batch,
     pair_hash,
 )
-from src.eval import evaluate_exact_match
+from src.eval import evaluate_exact_match, evaluate_exact_match_multi
 from src.model import ModelConfig, TinyDecoderLM, count_parameters
 
 
@@ -84,7 +84,7 @@ def set_seed(seed: int) -> None:
 class CurriculumBatchSampler:
     """Samples training batches with curriculum learning and holdout avoidance."""
 
-    def __init__(self, batch_size: int, seed: int, reserved_hashes: set,
+    def __init__(self, batch_size: int, seed: int, reserved_hashes: Set[int],
                  curriculum_phases: List[Tuple[int, int, int]]):
         self.batch_size = batch_size
         self.g = torch.Generator().manual_seed(seed)
@@ -165,7 +165,83 @@ def parse_wandb_project_path(value: str) -> Tuple[Optional[str], str]:
     return entity, project
 
 
+def clip_grad_norm_per_model(
+    parameters: Iterable[torch.nn.Parameter],
+    max_norm: float,
+    num_models: int,
+) -> torch.Tensor:
+    """Compute and clip gradient norms independently per model axis entry."""
+    grads = [p.grad for p in parameters if p.grad is not None]
+    if not grads:
+        return torch.zeros(num_models)
+
+    device = grads[0].device
+    total_sq = torch.zeros(num_models, device=device)
+
+    for g in grads:
+        if g.dim() == 0:
+            raise ValueError("Encountered scalar gradient; expected model-axis tensors")
+        if g.shape[0] != num_models:
+            raise ValueError(
+                "All gradients must have model axis in dim 0 for per-model clipping; "
+                f"got shape {tuple(g.shape)} with num_models={num_models}"
+            )
+        flat = g.detach().reshape(num_models, -1)
+        total_sq += (flat * flat).sum(dim=1)
+
+    total_norm = torch.sqrt(total_sq)
+
+    if max_norm > 0 and not math.isinf(max_norm):
+        clip_coef = (max_norm / (total_norm + 1e-6)).clamp(max=1.0)
+        for g in grads:
+            view = [num_models] + [1] * (g.dim() - 1)
+            g.mul_(clip_coef.view(*view))
+
+    return total_norm
+
+
+def _model_axis_state_keys(model: TinyDecoderLM, num_models: int) -> Set[str]:
+    keys: Set[str] = set()
+    for name, param in model.named_parameters():
+        if param.dim() > 0 and param.shape[0] == num_models:
+            keys.add(name)
+    for name, buf in model.named_buffers():
+        # Causal mask is shared, not model-axis specific.
+        if name.endswith("mask"):
+            continue
+        if buf.dim() > 0 and buf.shape[0] == num_models:
+            keys.add(name)
+    return keys
+
+
+def _slice_state_dict_for_model(
+    state_dict: Dict[str, torch.Tensor],
+    model_axis_keys: Set[str],
+    model_index: int,
+    num_models: int,
+) -> Dict[str, torch.Tensor]:
+    sliced: Dict[str, torch.Tensor] = {}
+    for key, value in state_dict.items():
+        if not torch.is_tensor(value):
+            sliced[key] = value
+            continue
+        # lm_head.weight is tied to token_emb.weight and may be omitted from
+        # named_parameters() deduplicated traversal, so keep a shape-based fallback.
+        has_model_axis = (
+            key in model_axis_keys
+            or (value.dim() > 0 and value.shape[0] == num_models and not key.endswith("mask"))
+        )
+        if has_model_axis:
+            sliced[key] = value[model_index:model_index + 1].clone()
+        else:
+            sliced[key] = value.clone()
+    return sliced
+
+
 def train(model_cfg: ModelConfig, train_cfg: TrainConfig) -> Dict:
+    if model_cfg.num_models < 1:
+        raise ValueError(f"num_models must be >= 1, got {model_cfg.num_models}")
+
     device = torch.device(train_cfg.device)
     dtype = DTYPE_MAP.get(train_cfg.dtype, torch.float32)
     run_dir = Path(train_cfg.run_dir)
@@ -173,39 +249,66 @@ def train(model_cfg: ModelConfig, train_cfg: TrainConfig) -> Dict:
     run_dir.mkdir(parents=True, exist_ok=True)
     split_dir.mkdir(parents=True, exist_ok=True)
 
-    metrics_path = run_dir / "metrics.csv"
+    num_models = model_cfg.num_models
+    model_seeds = [train_cfg.seed + i for i in range(num_models)]
     set_seed(train_cfg.seed)
 
-    split_path = split_dir / f"holdout_v{train_cfg.val_size}_t{train_cfg.test_size}_seed{train_cfg.seed}.pt"
-    splits = build_holdout_splits(train_cfg.val_size, train_cfg.test_size, train_cfg.seed, split_path)
+    val_a_by_model: List[torch.Tensor] = []
+    val_b_by_model: List[torch.Tensor] = []
+    reserved_hashes_by_model: List[Set[int]] = []
+    for seed_i in model_seeds:
+        split_path = split_dir / f"holdout_v{train_cfg.val_size}_t{train_cfg.test_size}_seed{seed_i}.pt"
+        splits = build_holdout_splits(train_cfg.val_size, train_cfg.test_size, seed_i, split_path)
 
-    reserved_hashes = set()
-    for ai, bi in zip(splits["val_a"].tolist(), splits["val_b"].tolist()):
-        reserved_hashes.add(pair_hash(int(ai), int(bi)))
-    for ai, bi in zip(splits["test_a"].tolist(), splits["test_b"].tolist()):
-        reserved_hashes.add(pair_hash(int(ai), int(bi)))
+        reserved_hashes: Set[int] = set()
+        for ai, bi in zip(splits["val_a"].tolist(), splits["val_b"].tolist()):
+            reserved_hashes.add(pair_hash(int(ai), int(bi)))
+        for ai, bi in zip(splits["test_a"].tolist(), splits["test_b"].tolist()):
+            reserved_hashes.add(pair_hash(int(ai), int(bi)))
 
-    val_a, val_b = splits["val_a"], splits["val_b"]
+        val_a_by_model.append(splits["val_a"])
+        val_b_by_model.append(splits["val_b"])
+        reserved_hashes_by_model.append(reserved_hashes)
 
-    # Mixed precision: model stays fp32, autocast handles fp16/bf16 in forward pass
-    # This keeps optimizer states (AdamW moments) in fp32 for numerical stability
+    samplers = [
+        CurriculumBatchSampler(
+            train_cfg.batch_size,
+            train_cfg.seed + 1337 + i,
+            reserved_hashes_by_model[i],
+            CURRICULUM_PHASES,
+        )
+        for i in range(num_models)
+    ]
+
+    if num_models == 1:
+        model_run_dirs = [run_dir]
+        model_run_names = [train_cfg.run_name]
+        best_ckpt_paths = [Path(train_cfg.best_ckpt_out)]
+        last_ckpt_paths = [Path(train_cfg.last_ckpt_out)]
+    else:
+        model_run_dirs = [run_dir / f"model_{i:03d}" for i in range(num_models)]
+        model_run_names = [f"{train_cfg.run_name}_model{i:03d}" for i in range(num_models)]
+        best_ckpt_paths = [d / "checkpoints" / "best.pt" for d in model_run_dirs]
+        last_ckpt_paths = [d / "checkpoints" / "last.pt" for d in model_run_dirs]
+
+    metrics_paths = [d / "metrics.csv" for d in model_run_dirs]
+    metrics_header = ["step", "train_loss", "val_exact", "val_token_acc", "grad_norm", "lr", "elapsed_sec"]
+    for path in metrics_paths:
+        save_csv_header(path, metrics_header)
+
+    # Mixed precision: model stays fp32, autocast handles fp16/bf16 in forward pass.
     use_amp = (dtype != torch.float32 and device.type == "cuda")
     model = TinyDecoderLM(model_cfg).to(device=device)  # always fp32
-    params = count_parameters(model)
+
+    params_total = count_parameters(model)
+    params_per_model = params_total // num_models
+
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=train_cfg.lr, weight_decay=train_cfg.weight_decay
     )
 
-    sampler = CurriculumBatchSampler(
-        train_cfg.batch_size, train_cfg.seed + 1337,
-        reserved_hashes, CURRICULUM_PHASES,
-    )
-
-    save_csv_header(metrics_path,
-                    ["step", "train_loss", "val_exact", "val_token_acc", "grad_norm", "lr", "elapsed_sec"])
-
-    best_val = -1.0
-    best_step = -1
+    best_val = [-1.0 for _ in range(num_models)]
+    best_step = [-1 for _ in range(num_models)]
     t0 = time.time()
 
     # GradScaler for fp16 (not needed for bf16)
@@ -213,40 +316,70 @@ def train(model_cfg: ModelConfig, train_cfg: TrainConfig) -> Dict:
     scaler = torch.amp.GradScaler("cuda") if use_scaler else None
 
     print(f"Run: {train_cfg.run_name}")
-    print(f"Params: {params}")
+    if num_models == 1:
+        print(f"Params: {params_total}")
+    else:
+        print(
+            f"Params: total={params_total} "
+            f"({params_per_model} per model x {num_models} models)"
+        )
     print(f"Model config: {model_cfg}")
+    print(f"Model seeds: {model_seeds}")
     print(f"Device: {device}, amp_dtype: {dtype}, use_amp: {use_amp}, scaler: {use_scaler}")
     print(f"Curriculum: {CURRICULUM_PHASES}")
 
-    wandb_run = None
+    wandb_runs: List[Optional[object]] = [None for _ in range(num_models)]
     if train_cfg.wandb and train_cfg.wandb_mode != "disabled":
         try:
             import wandb
 
             entity, project = parse_wandb_project_path(train_cfg.wandb_project)
-            wandb_init = {
-                "project": project,
-                "name": train_cfg.run_name,
-                "mode": train_cfg.wandb_mode,
-                "config": {
-                    "model": asdict(model_cfg),
-                    "train": asdict(train_cfg),
-                    "curriculum_phases": CURRICULUM_PHASES,
-                    "params": params,
-                },
-            }
-            if entity is not None:
-                wandb_init["entity"] = entity
-            wandb_run = wandb.init(**wandb_init)
+            for i in range(num_models):
+                cfg_for_run = replace(model_cfg, num_models=1)
+                wandb_init = {
+                    "project": project,
+                    "name": model_run_names[i],
+                    "group": train_cfg.run_name if num_models > 1 else None,
+                    "mode": train_cfg.wandb_mode,
+                    "reinit": "create_new",
+                    "config": {
+                        "model": asdict(cfg_for_run),
+                        "train": asdict(train_cfg),
+                        "curriculum_phases": CURRICULUM_PHASES,
+                        "params": params_per_model if num_models > 1 else params_total,
+                        "parallel": {
+                            "num_models": num_models,
+                            "model_index": i,
+                            "model_seed": model_seeds[i],
+                            "base_seed": train_cfg.seed,
+                        },
+                    },
+                }
+                if wandb_init["group"] is None:
+                    del wandb_init["group"]
+                if entity is not None:
+                    wandb_init["entity"] = entity
+                wandb_runs[i] = wandb.init(**wandb_init)
             print(f"W&B: logging to {train_cfg.wandb_project} (mode={train_cfg.wandb_mode})")
         except Exception as exc:
             print(f"W&B: disabled ({exc})")
+            wandb_runs = [None for _ in range(num_models)]
+
+    model_axis_keys = _model_axis_state_keys(model, num_models)
+    single_model_cfg = replace(model_cfg, num_models=1)
 
     for step in range(train_cfg.train_steps):
         model.train()
-        x, y = sampler.sample_batch(step)
-        x, y = x.to(device), y.to(device)
-        grad_norm = float("nan")
+
+        x_batches: List[torch.Tensor] = []
+        y_batches: List[torch.Tensor] = []
+        for sampler in samplers:
+            x_i, y_i = sampler.sample_batch(step)
+            x_batches.append(x_i)
+            y_batches.append(y_i)
+
+        x = torch.stack(x_batches, dim=0).to(device)  # [M, B, T]
+        y = torch.stack(y_batches, dim=0).to(device)  # [M, B, T]
 
         lr_now = cosine_lr(step, train_cfg.train_steps, train_cfg.lr,
                            train_cfg.warmup_steps, train_cfg.min_lr_ratio)
@@ -256,98 +389,244 @@ def train(model_cfg: ModelConfig, train_cfg: TrainConfig) -> Dict:
         optimizer.zero_grad(set_to_none=True)
         if use_amp:
             with torch.amp.autocast("cuda", dtype=dtype):
-                _, loss = model(x, y)
+                _, loss, per_model_loss = model(x, y, return_per_model_loss=True)
             if scaler is not None:
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
                 clip_max_norm = train_cfg.grad_clip if train_cfg.grad_clip > 0 else float("inf")
-                grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), clip_max_norm))
+                grad_norm = clip_grad_norm_per_model(model.parameters(), clip_max_norm, num_models)
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 loss.backward()
                 clip_max_norm = train_cfg.grad_clip if train_cfg.grad_clip > 0 else float("inf")
-                grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), clip_max_norm))
+                grad_norm = clip_grad_norm_per_model(model.parameters(), clip_max_norm, num_models)
                 optimizer.step()
         else:
-            _, loss = model(x, y)
+            _, loss, per_model_loss = model(x, y, return_per_model_loss=True)
             loss.backward()
             clip_max_norm = train_cfg.grad_clip if train_cfg.grad_clip > 0 else float("inf")
-            grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), clip_max_norm))
+            grad_norm = clip_grad_norm_per_model(model.parameters(), clip_max_norm, num_models)
             optimizer.step()
 
         if (step % train_cfg.eval_interval == 0) or (step == train_cfg.train_steps - 1):
-            val_exact, val_tok = evaluate_exact_match(
-                model, val_a, val_b, train_cfg.eval_batch_size, device
-            )
+            if num_models == 1:
+                val_exact_single, val_tok_single = evaluate_exact_match(
+                    model,
+                    val_a_by_model[0],
+                    val_b_by_model[0],
+                    train_cfg.eval_batch_size,
+                    device,
+                )
+                val_exact = [val_exact_single]
+                val_tok = [val_tok_single]
+            else:
+                val_exact, val_tok = evaluate_exact_match_multi(
+                    model,
+                    val_a_by_model,
+                    val_b_by_model,
+                    train_cfg.eval_batch_size,
+                    device,
+                )
+
             elapsed = time.time() - t0
-            train_loss = float(loss.item())
-            append_csv(metrics_path, [step, train_loss, val_exact, val_tok, grad_norm, lr_now, elapsed])
-            print(
-                f"step={step:6d} loss={train_loss:.4f} val_exact={val_exact:.4f} "
-                f"val_tok={val_tok:.5f} grad_norm={grad_norm:.4f} lr={lr_now:.2e} t={elapsed:.1f}s"
-            )
-            if wandb_run is not None:
-                wandb_run.log(
-                    {
-                        "train/loss": train_loss,
-                        "val/exact_match": val_exact,
-                        "val/token_acc": val_tok,
-                        "optim/grad_norm": grad_norm,
-                        "optim/lr": lr_now,
-                        "time/elapsed_sec": elapsed,
-                    },
-                    step=step,
+            per_model_loss_vals = [float(v) for v in per_model_loss.detach().cpu().tolist()]
+            grad_norm_vals = [float(v) for v in grad_norm.detach().cpu().tolist()]
+
+            if num_models == 1:
+                append_csv(
+                    metrics_paths[0],
+                    [step, per_model_loss_vals[0], val_exact[0], val_tok[0], grad_norm_vals[0], lr_now, elapsed],
+                )
+                print(
+                    f"step={step:6d} loss={per_model_loss_vals[0]:.4f} val_exact={val_exact[0]:.4f} "
+                    f"val_tok={val_tok[0]:.5f} grad_norm={grad_norm_vals[0]:.4f} "
+                    f"lr={lr_now:.2e} t={elapsed:.1f}s"
+                )
+            else:
+                for i in range(num_models):
+                    append_csv(
+                        metrics_paths[i],
+                        [step, per_model_loss_vals[i], val_exact[i], val_tok[i], grad_norm_vals[i], lr_now, elapsed],
+                    )
+                print(
+                    f"step={step:6d} "
+                    f"loss_mean={sum(per_model_loss_vals)/num_models:.4f} "
+                    f"val_exact_mean={sum(val_exact)/num_models:.4f} "
+                    f"val_exact_min={min(val_exact):.4f} "
+                    f"val_exact_max={max(val_exact):.4f} "
+                    f"lr={lr_now:.2e} t={elapsed:.1f}s"
                 )
 
-            if val_exact > best_val:
-                best_val = val_exact
-                best_step = step
-                Path(train_cfg.best_ckpt_out).parent.mkdir(parents=True, exist_ok=True)
-                torch.save(
-                    {
-                        "model_state": model.state_dict(),
-                        "model_config": asdict(model_cfg),
-                        "train_config": asdict(train_cfg),
-                        "step": step,
-                        "val_exact": val_exact,
-                        "params": params,
-                    },
-                    train_cfg.best_ckpt_out,
-                )
-                if wandb_run is not None:
-                    wandb_run.summary["best_val_exact"] = best_val
-                    wandb_run.summary["best_step"] = best_step
+            for i in range(num_models):
+                if wandb_runs[i] is not None:
+                    wandb_runs[i].log(
+                        {
+                            "train/loss": per_model_loss_vals[i],
+                            "val/exact_match": val_exact[i],
+                            "val/token_acc": val_tok[i],
+                            "optim/grad_norm": grad_norm_vals[i],
+                            "optim/lr": lr_now,
+                            "time/elapsed_sec": elapsed,
+                        },
+                        step=step,
+                    )
 
-    Path(train_cfg.last_ckpt_out).parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "model_state": model.state_dict(),
+            improved = [i for i in range(num_models) if val_exact[i] > best_val[i]]
+            if improved:
+                full_state = model.state_dict()
+                for i in improved:
+                    best_val[i] = val_exact[i]
+                    best_step[i] = step
+
+                    if num_models == 1:
+                        model_state = full_state
+                        model_config_payload = asdict(model_cfg)
+                        train_config_payload = asdict(train_cfg)
+                        params_payload = params_total
+                    else:
+                        model_state = _slice_state_dict_for_model(full_state, model_axis_keys, i, num_models)
+                        model_config_payload = asdict(single_model_cfg)
+                        train_config_payload = asdict(train_cfg)
+                        train_config_payload["base_seed"] = train_cfg.seed
+                        train_config_payload["seed"] = model_seeds[i]
+                        train_config_payload["model_index"] = i
+                        train_config_payload["num_models"] = num_models
+                        train_config_payload["run_name"] = model_run_names[i]
+                        train_config_payload["run_dir"] = str(model_run_dirs[i])
+                        train_config_payload["best_ckpt_out"] = str(best_ckpt_paths[i])
+                        train_config_payload["last_ckpt_out"] = str(last_ckpt_paths[i])
+                        params_payload = params_per_model
+
+                    best_ckpt_paths[i].parent.mkdir(parents=True, exist_ok=True)
+                    torch.save(
+                        {
+                            "model_state": model_state,
+                            "model_config": model_config_payload,
+                            "train_config": train_config_payload,
+                            "step": step,
+                            "val_exact": val_exact[i],
+                            "params": params_payload,
+                        },
+                        best_ckpt_paths[i],
+                    )
+
+                    if wandb_runs[i] is not None:
+                        wandb_runs[i].summary["best_val_exact"] = best_val[i]
+                        wandb_runs[i].summary["best_step"] = best_step[i]
+
+    full_state = model.state_dict()
+    for i in range(num_models):
+        if num_models == 1:
+            model_state = full_state
+            model_config_payload = asdict(model_cfg)
+            train_config_payload = asdict(train_cfg)
+            params_payload = params_total
+        else:
+            model_state = _slice_state_dict_for_model(full_state, model_axis_keys, i, num_models)
+            model_config_payload = asdict(single_model_cfg)
+            train_config_payload = asdict(train_cfg)
+            train_config_payload["base_seed"] = train_cfg.seed
+            train_config_payload["seed"] = model_seeds[i]
+            train_config_payload["model_index"] = i
+            train_config_payload["num_models"] = num_models
+            train_config_payload["run_name"] = model_run_names[i]
+            train_config_payload["run_dir"] = str(model_run_dirs[i])
+            train_config_payload["best_ckpt_out"] = str(best_ckpt_paths[i])
+            train_config_payload["last_ckpt_out"] = str(last_ckpt_paths[i])
+            params_payload = params_per_model
+
+        last_ckpt_paths[i].parent.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {
+                "model_state": model_state,
+                "model_config": model_config_payload,
+                "train_config": train_config_payload,
+                "step": train_cfg.train_steps - 1,
+                "val_exact": best_val[i],
+                "params": params_payload,
+            },
+            last_ckpt_paths[i],
+        )
+
+    elapsed_sec = time.time() - t0
+
+    if num_models == 1:
+        summary = {
+            "run_name": train_cfg.run_name,
+            "params": params_total,
+            "best_val_exact": best_val[0],
+            "best_step": best_step[0],
+            "train_steps": train_cfg.train_steps,
+            "elapsed_sec": elapsed_sec,
             "model_config": asdict(model_cfg),
-            "train_config": asdict(train_cfg),
-            "step": train_cfg.train_steps - 1,
-            "val_exact": best_val,
-            "params": params,
-        },
-        train_cfg.last_ckpt_out,
-    )
+        }
+        save_json(run_dir / "summary.json", summary)
+        save_json(run_dir / "config.json", {"model": asdict(model_cfg), "train": asdict(train_cfg)})
+    else:
+        model_summaries = []
+        for i in range(num_models):
+            per_model_summary = {
+                "run_name": model_run_names[i],
+                "model_index": i,
+                "seed": model_seeds[i],
+                "params": params_per_model,
+                "best_val_exact": best_val[i],
+                "best_step": best_step[i],
+                "train_steps": train_cfg.train_steps,
+                "elapsed_sec": elapsed_sec,
+                "model_config": asdict(single_model_cfg),
+            }
+            model_summaries.append(per_model_summary)
+            save_json(model_run_dirs[i] / "summary.json", per_model_summary)
+            save_json(
+                model_run_dirs[i] / "config.json",
+                {
+                    "model": asdict(single_model_cfg),
+                    "train": {
+                        **asdict(train_cfg),
+                        "base_seed": train_cfg.seed,
+                        "seed": model_seeds[i],
+                        "model_index": i,
+                        "num_models": num_models,
+                        "run_name": model_run_names[i],
+                        "run_dir": str(model_run_dirs[i]),
+                    },
+                },
+            )
 
-    summary = {
-        "run_name": train_cfg.run_name,
-        "params": params,
-        "best_val_exact": best_val,
-        "best_step": best_step,
-        "train_steps": train_cfg.train_steps,
-        "elapsed_sec": time.time() - t0,
-        "model_config": asdict(model_cfg),
-    }
-    save_json(run_dir / "summary.json", summary)
-    save_json(run_dir / "config.json", {"model": asdict(model_cfg), "train": asdict(train_cfg)})
-    if wandb_run is not None:
-        wandb_run.summary["final_val_exact"] = summary["best_val_exact"]
-        wandb_run.summary["final_best_step"] = summary["best_step"]
-        wandb_run.summary["elapsed_sec"] = summary["elapsed_sec"]
-        wandb_run.finish()
+        summary = {
+            "run_name": train_cfg.run_name,
+            "num_models": num_models,
+            "params_per_model": params_per_model,
+            "params_total": params_total,
+            "train_steps": train_cfg.train_steps,
+            "elapsed_sec": elapsed_sec,
+            "model_config": asdict(model_cfg),
+            "aggregate": {
+                "best_val_exact_mean": sum(best_val) / num_models,
+                "best_val_exact_min": min(best_val),
+                "best_val_exact_max": max(best_val),
+            },
+            "models": model_summaries,
+        }
+        save_json(run_dir / "summary.json", summary)
+        save_json(
+            run_dir / "config.json",
+            {
+                "model": asdict(model_cfg),
+                "train": asdict(train_cfg),
+                "model_seeds": model_seeds,
+            },
+        )
+
+    for i in range(num_models):
+        if wandb_runs[i] is not None:
+            wandb_runs[i].summary["final_val_exact"] = best_val[i]
+            wandb_runs[i].summary["final_best_step"] = best_step[i]
+            wandb_runs[i].summary["elapsed_sec"] = elapsed_sec
+            wandb_runs[i].finish()
+
     return summary
 
 
@@ -361,7 +640,8 @@ def main() -> None:
     p.add_argument("--device", type=str, default="cpu")
     p.add_argument("--dtype", type=str, default="fp32", choices=["fp32", "fp16", "bf16"],
                    help="Training precision (fp32, fp16, bf16)")
-    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--seed", type=int, default=42,
+                   help="Base seed. Model i uses seed+i when --num-models > 1")
     p.add_argument("--wandb", action=argparse.BooleanOptionalAction, default=True,
                    help="Enable Weights & Biases logging")
     p.add_argument("--wandb-project", type=str,
@@ -376,6 +656,8 @@ def main() -> None:
     p.add_argument("--d-model", type=int, default=8)
     p.add_argument("--n-head", type=int, default=1)
     p.add_argument("--d-ff", type=int, default=28)
+    p.add_argument("--num-models", type=int, default=8,
+                   help="Number of independent models trained in parallel")
     # low-rank options
     p.add_argument("--pos-rank", type=int, default=0, help="Position embedding rank (0=full)")
     p.add_argument("--qkv-rank", type=int, default=0, help="QKV projection rank (0=full)")
@@ -387,7 +669,6 @@ def main() -> None:
         default=True,
         help="Add fixed full-rank random term to low-rank linear layers",
     )
-
 
     # optimization (gpt-acc-jax defaults)
     p.add_argument("--train-steps", type=int, default=30000)
@@ -421,6 +702,7 @@ def main() -> None:
         attn_out_rank=args.attn_out_rank,
         ffn_rank=args.ffn_rank,
         fixed_full_rank=args.fixed_full_rank,
+        num_models=args.num_models,
     )
 
     run_dir = Path(args.run_dir)

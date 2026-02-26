@@ -3,7 +3,7 @@
 import argparse
 import json
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Sequence, Tuple
 
 import torch
 
@@ -38,6 +38,12 @@ def evaluate_exact_match(
     batch_size: int,
     device: torch.device,
 ) -> Tuple[float, float]:
+    if model.cfg.num_models != 1:
+        raise ValueError(
+            "evaluate_exact_match expects a single-model checkpoint "
+            "(num_models=1). Use evaluate_exact_match_multi for vectorized models."
+        )
+
     model.eval()
     n = int(a.numel())
     exact = 0
@@ -61,6 +67,66 @@ def evaluate_exact_match(
         exact += int(matches.all(dim=1).sum().item())
 
     return exact / n, token_correct / token_total
+
+
+@torch.no_grad()
+def evaluate_exact_match_multi(
+    model: TinyDecoderLM,
+    all_a: Sequence[torch.Tensor],
+    all_b: Sequence[torch.Tensor],
+    batch_size: int,
+    device: torch.device,
+) -> Tuple[List[float], List[float]]:
+    """Vectorized exact-match evaluation for model-axis checkpoints.
+
+    Args:
+        model: TinyDecoderLM with num_models=M.
+        all_a/all_b: Sequences of length M. all_a[m], all_b[m] are each [N].
+    Returns:
+        (exact_per_model, token_acc_per_model), each length M.
+    """
+    model.eval()
+    msz = model.cfg.num_models
+    if len(all_a) != msz or len(all_b) != msz:
+        raise ValueError(
+            f"Expected {msz} validation tensors per operand, got "
+            f"{len(all_a)} and {len(all_b)}"
+        )
+    n = int(all_a[0].numel())
+    if n == 0:
+        raise ValueError("Validation tensors must be non-empty")
+    for m in range(msz):
+        if int(all_a[m].numel()) != n or int(all_b[m].numel()) != n:
+            raise ValueError("All model validation tensors must have equal lengths")
+
+    exact = torch.zeros(msz, dtype=torch.int64)
+    token_correct = torch.zeros(msz, dtype=torch.int64)
+    token_total = n * SUM_DIGITS
+
+    for start in range(0, n, batch_size):
+        end = min(start + batch_size, n)
+
+        prompts = []
+        tgt_digits = []
+        for m in range(msz):
+            aa = all_a[m][start:end]
+            bb = all_b[m][start:end]
+            prompts.append(preprocess_batch(aa, bb))
+            tgt = ((aa + bb)[:, None] // POW10_11[None, :]) % 10
+            tgt_digits.append(tgt.to(torch.long))
+
+        prompt_t = torch.stack(prompts, dim=0).to(device)  # [M, B, PROMPT_LEN]
+        gen = model.generate(prompt_t, max_new_tokens=TARGET_LEN)
+        pred_digits = gen[:, :, -TARGET_LEN:-1].to("cpu")  # [M, B, SUM_DIGITS]
+        tgt = torch.stack(tgt_digits, dim=0)
+
+        matches = pred_digits.eq(tgt)
+        token_correct += matches.sum(dim=(1, 2))
+        exact += matches.all(dim=2).sum(dim=1)
+
+    em = (exact.float() / n).tolist()
+    tok = (token_correct.float() / token_total).tolist()
+    return em, tok
 
 
 @torch.no_grad()

@@ -1006,3 +1006,164 @@ uv run python -m src.train \
 - Conclusion:
   - Failed stability constraint (`1/3` seeds reached `>=0.99`).
   - Despite one fast seed, variance is too high for reliable time-to-99 optimization.
+
+### Experiment E31: Vectorized Multi-Model Training (`num_models`) Implementation Validation
+- Goal:
+  - Validate model-axis (`m`) vectorized training of multiple independent models in one process.
+  - Verify per-model gradient isolation, per-model clipping, checkpoint compatibility, W&B multi-run logging, and backward compatibility (`num_models=1`).
+
+- Code change summary:
+  - `src/model.py`:
+    - Added `num_models` to `ModelConfig`.
+    - Refactored embedding/linear/layernorm/attention/MLP to model-axis aware tensors.
+    - Added per-model CE reduction helper and vectorized `generate` support.
+    - Kept embedding-output tying (`lm_head.weight` tied to `token_emb.weight`) per model.
+  - `src/train.py`:
+    - Added `--num-models` CLI flag.
+    - Added multi-model data sampling (`seed+i` streams), per-model grad clipping, per-model checkpoints, and per-model metrics CSVs.
+    - Added one W&B run per model (grouped by parent run name).
+  - `src/eval.py`:
+    - Added `evaluate_exact_match_multi(...)` for vectorized per-model eval in training.
+    - Kept single-model `evaluate_exact_match(...)` behavior unchanged for checkpoint evaluation flows.
+  - `README.md`:
+    - Documented `--num-models`, seed policy, output layout, and W&B grouping behavior.
+
+- Validation commands:
+```bash
+# 1) Model-shape/backward/isolation unit checks
+uv run python - <<'PY'
+import torch
+from src.model import ModelConfig, TinyDecoderLM
+from src.train import clip_grad_norm_per_model
+
+cfg = ModelConfig(num_models=3)
+model = TinyDecoderLM(cfg)
+idx = torch.randint(0, 14, (3, 4, 33), dtype=torch.long)
+tgt = torch.randint(0, 14, (3, 4, 33), dtype=torch.long)
+tgt[:, :, :21] = -100
+logits, loss, per_model = model(idx, tgt, return_per_model_loss=True)
+loss.backward()
+clip_grad_norm_per_model(model.parameters(), 1.0, 3)
+
+model.zero_grad(set_to_none=True)
+_, _, pm = model(idx, tgt, return_per_model_loss=True)
+pm[0].backward()
+max_other = 0.0
+for p in model.parameters():
+    if p.grad is not None and p.grad.shape[0] == 3:
+        max_other = max(max_other, float(p.grad[1:].abs().max().item()))
+print("independence_max_other_grad", max_other)
+PY
+
+# 2) Multi-model trainer smoke
+uv run python -m src.train \
+  --run-name smoke_num_models3_cpu \
+  --num-models 3 \
+  --train-steps 2 --eval-interval 1 \
+  --batch-size 8 --val-size 16 --test-size 16 --eval-batch-size 16 \
+  --device cpu --wandb --wandb-mode disabled
+
+# 3) Checkpoint compatibility (existing eval pipeline)
+uv run python evaluate_checkpoints.py \
+  results/runs/smoke_num_models3_cpu/model_000/checkpoints/best.pt \
+  --device cpu --batch-size 2048 \
+  --output results/smoke_num_models3_cpu_model000_eval.json
+
+# 4) W&B multi-run offline smoke
+uv run python -m src.train \
+  --run-name smoke_num_models3_wandb_offline \
+  --num-models 3 \
+  --train-steps 1 --eval-interval 1 \
+  --batch-size 8 --val-size 16 --test-size 16 --eval-batch-size 16 \
+  --device cpu --wandb --wandb-mode offline
+
+# 5) Backward compatibility smoke (num_models=1)
+uv run python -m src.train \
+  --run-name smoke_num_models1_compat \
+  --num-models 1 \
+  --train-steps 1 --eval-interval 1 \
+  --batch-size 8 --val-size 16 --test-size 16 --eval-batch-size 16 \
+  --device cpu --wandb --wandb-mode disabled
+
+# 6) Performance sanity on MPS (short benchmark)
+uv run python -m src.train \
+  --run-name perf_num_models1_mps \
+  --num-models 1 \
+  --train-steps 501 --eval-interval 500 \
+  --batch-size 64 --val-size 256 --test-size 256 --eval-batch-size 256 \
+  --device mps --wandb --wandb-mode disabled
+
+uv run python -m src.train \
+  --run-name perf_num_models3_mps \
+  --num-models 3 \
+  --train-steps 501 --eval-interval 500 \
+  --batch-size 64 --val-size 256 --test-size 256 --eval-batch-size 256 \
+  --device mps --wandb --wandb-mode disabled
+```
+
+- Outputs:
+  - `results/runs/smoke_num_models3_cpu/summary.json`
+  - `results/runs/smoke_num_models3_cpu/model_000/checkpoints/best.pt`
+  - `results/runs/smoke_num_models3_cpu/model_001/checkpoints/best.pt`
+  - `results/runs/smoke_num_models3_cpu/model_002/checkpoints/best.pt`
+  - `results/smoke_num_models3_cpu_model000_eval.json`
+  - `results/runs/smoke_num_models3_wandb_offline/summary.json`
+  - `results/runs/smoke_num_models1_compat/summary.json`
+  - `results/runs/perf_num_models1_mps/metrics.csv`
+  - `results/runs/perf_num_models3_mps/metrics.csv`
+  - W&B offline runs:
+    - `wandb/offline-run-20260226_143027-micoxv8i`
+    - `wandb/offline-run-20260226_143028-ls2jdpd7`
+    - `wandb/offline-run-20260226_143028-j5ldm9fl`
+
+- Findings:
+  - Model-axis shape and backward smoke checks pass:
+    - logits shape: `(3, 4, 33, 14)`
+    - loss is scalar
+    - per-model loss shape: `(3,)`
+  - Gradient independence check passes:
+    - `independence_max_other_grad = 0.0` when optimizing only model-0 loss.
+  - Per-model clipping behaves independently (norms reported per model, clipping not global).
+  - Multi-model trainer smoke writes expected per-model directory layout and checkpoints.
+  - `evaluate_checkpoints.py` can load sliced per-model checkpoints (compatibility preserved).
+  - W&B offline mode now creates one active run per model without run-finalization conflicts.
+  - Backward-compatible `num_models=1` run still emits single-run summary/checkpoint schema.
+  - Short MPS performance sanity:
+    - `num_models=1`: ~15.57s to step 500
+    - `num_models=3`: ~16.73s to step 500
+    - Observed near-flat wall-clock increase in this short benchmark, indicating good vectorization utilization on this hardware.
+
+- Conclusion:
+  - Vectorized multi-model training is functional with independent optimization behavior per model and compatible per-model checkpoint artifacts.
+
+### Experiment E32: MPS Throughput Benchmark (`num_models=8`, step 500)
+- Goal:
+  - Benchmark short-run wall-clock performance for `num_models=8` on this hardware, comparable to prior `num_models=1` and `num_models=3` checks.
+- Command:
+```bash
+uv run python -m src.train \
+  --run-name perf_num_models8_mps \
+  --num-models 8 \
+  --train-steps 501 --eval-interval 500 \
+  --batch-size 64 --val-size 256 --test-size 256 --eval-batch-size 256 \
+  --device mps --wandb --wandb-mode disabled
+```
+- Outputs:
+  - `results/runs/perf_num_models8_mps/summary.json`
+  - `results/runs/perf_num_models8_mps/model_000/metrics.csv`
+  - `results/runs/perf_num_models8_mps/model_001/metrics.csv`
+  - `results/runs/perf_num_models8_mps/model_002/metrics.csv`
+  - `results/runs/perf_num_models8_mps/model_003/metrics.csv`
+  - `results/runs/perf_num_models8_mps/model_004/metrics.csv`
+  - `results/runs/perf_num_models8_mps/model_005/metrics.csv`
+  - `results/runs/perf_num_models8_mps/model_006/metrics.csv`
+  - `results/runs/perf_num_models8_mps/model_007/metrics.csv`
+- Findings:
+  - `params_total=7168` (`896` per model x `8` models)
+  - Step-500 elapsed wall-clock: `15.875s`
+  - Short benchmark comparison:
+    - `num_models=1`: `15.572s` (E31)
+    - `num_models=3`: `16.729s` (E31)
+    - `num_models=8`: `15.875s` (this run)
+- Conclusion:
+  - On this short MPS benchmark, `num_models=8` maintained nearly flat wall-clock relative to `num_models=1`, indicating strong hardware utilization for vectorized parallel models in this setup.
