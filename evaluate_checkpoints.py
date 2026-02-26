@@ -30,7 +30,7 @@ def main():
 
     # Load model
     ckpt = torch.load(args.checkpoint, map_location=args.device, weights_only=False)
-    cfg = ModelConfig(**ckpt["model_config"])
+    cfg = ModelConfig.from_dict(ckpt["model_config"])
     model = TinyDecoderLM(cfg).to(args.device)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
@@ -64,7 +64,7 @@ def main():
 
     # Build result dict
     result = {
-        "model": f"{params}-parameter low-rank transformer",
+        "model": f"{params}-parameter transformer",
         "checkpoint": args.checkpoint,
         "parameters": params,
         "config": {

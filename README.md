@@ -2,17 +2,15 @@
 
 A **456-parameter** transformer that solves 10-digit integer addition. Given two integers A, B in [0, 10^10), the model predicts C = A + B autoregressively, achieving **100% exact-match accuracy** on 100,000 test examples.
 
-Building on [smallest-addition-transformer-codex](https://github.com/anadim/smallest-addition-transformer-codex) (1,644 params) and [gpt-acc-jax](https://github.com/yhavinga/gpt-acc-jax) (777 params), we introduce **low-rank factorization** (W = AB, rank 3) to reduce the model to 512 parameters. [digit-addition-491p](https://github.com/rezabyt/digit-addition-491p) then replaced LayerNorm with **RMSNorm w/o bias** to reach 491 parameters. We build on this and add two further techniques to reach **456 parameters**:
-- **Shared-A tied-KV QKV**: In the low-rank QKV factorization (Q, K, V = h·Bq, h·Bk, h·Bv where h = x·A), we tie Bk = Bv so that K = V, reducing from 3 B-matrices to 2 (saves 21 parameters).
-- **Rank-2 attention output**: Attention output projection reduced from rank 3 to rank 2 (saves 14 parameters).
+Current code focus: baseline transformer with optional rank factorization (`pos_rank`, `qkv_rank`, `attn_out_rank`, `ffn_rank`). The model path uses LayerNorm and standard QKV projections (full-rank or low-rank), with only embedding/output weight tying supported.
+
+The repo also includes historical results from earlier variants explored in the ecosystem (including RMSNorm and QKV-tying ideas), but those are not part of the current trainable code path.
 
 
 
 ## Grokking
 
 All successful models exhibit **grokking**: prolonged near-zero accuracy followed by a sudden phase transition.
-
-![Grokking curves](results/grokking_plot.png)
 
 
 ## Leaderboard
@@ -22,26 +20,25 @@ All successful models exhibit **grokking**: prolonged near-zero accuracy followe
 | 1,644 | Codex baseline | 99.04% | [Papailiopoulos](https://github.com/anadim/smallest-addition-transformer-codex) |
 | 777 | gpt-acc-jax (pico-7d-ff14-lr02) | 99.69% | [Havinga](https://github.com/yhavinga/gpt-acc-jax) |
 | 512 | + Low-rank factorization (rank 3) | 99.988% | Ours |
-| 491 | + RMSNorm w/o bias | 99.97% | [rezabyt](https://github.com/rezabyt/digit-addition-491p) |
-| **456** | **+ shareA_tieKV + rank-2 attn output** | **100%** | **Ours** |
+| 491 | Historical RMSNorm variant | 99.97% | [rezabyt](https://github.com/rezabyt/digit-addition-491p) |
+| **456** | **Historical 456p variant** | **100%** | **Ours** |
 
 ## Architecture
 
-Single-layer, single-head, decoder-only transformer with d_model=7, d_ff=14, vocabulary size 14 (digits 0-9, `+`, `=`, `<PAD>`, `<EOS>`).
+Current code path: single-layer, single-head, decoder-only transformer with vocabulary size 14 (digits 0-9, `+`, `=`, `<PAD>`, `<EOS>`). Norms are `LayerNorm`; QKV/attention-output/FFN/position projections are full-rank when rank=0 and low-rank when the corresponding `*_rank` is >0.
 
-| Component | Factorization | Params |
-|---|---|---|
-| Token embedding (tied) | 14 × 7 | 98 |
-| Position embedding (rank-3) | 33×3 + 3×7 | 120 |
-| RMSNorm (pre-attn) | weight only | 7 |
-| QKV (shareA_tieKV, r=3) | A: 7×3; Bq: 3×7; Bkv: 3×7 | 63 |
-| Attention output (r=2) | 7×2 + 2×7 | 28 |
-| RMSNorm (pre-FFN) | weight only | 7 |
-| FFN up (r=3) | 7×3 + 3×14 | 63 |
-| FFN down (r=3) | 14×3 + 3×7 | 63 |
-| Final RMSNorm | weight only | 7 |
-| Output head | (tied with token embedding) | 0 |
-| **Total** | | **456** |
+| Component | Implementation |
+|---|---|
+| Token embedding + LM head | Tied (`lm_head.weight = token_emb.weight`) |
+| Position embedding | Full-rank embedding or low-rank factorized embedding (`pos_rank`) |
+| Attention QKV | Full-rank linear or low-rank factorized linear (`qkv_rank`) |
+| Attention output | Full-rank linear or low-rank factorized linear (`attn_out_rank`) |
+| FFN up/down | Full-rank linear or low-rank factorized linear (`ffn_rank`) |
+| Normalization | `LayerNorm` |
+
+Reference parameter counts in current code:
+- `d_model=7`, `d_ff=14`, all ranks `0`: `763` params.
+- `d_model=7`, `d_ff=14`, `pos_rank=3`, `qkv_rank=3`, `attn_out_rank=2`, `ffn_rank=3`: `498` params.
 
 ## Results
 
@@ -66,37 +63,38 @@ uv sync
 
 Training runs auto-log to Weights & Biases at `maxence-frenette/transformer-10-digit-addition`.
 Use `--no-wandb` to disable logging for a run.
+Only embedding/output weight tying is supported in this code path.
 
 ### Evaluate Pre-trained Checkpoint
 
 ```bash
 uv run python evaluate_checkpoints.py \
-  checkpoints/best_456p_s43.pt --device cuda
+  results/runs/<run_name>/checkpoints/best.pt --device cuda
 ```
 
 ### Single Prediction
 
 ```bash
 uv run python -m src.eval predict \
-  --ckpt checkpoints/best_456p_s43.pt \
+  --ckpt results/runs/<run_name>/checkpoints/best.pt \
   --a 1234567890 --b 9876543210
 ```
 
 ### Train from Scratch
 
 ```bash
-# 456-param model (best: seed 43)
+# d=8 baseline (reliable on this repo/hardware)
 uv run python -m src.train \
-  --run-name best_456 \
-  --pos-rank 3 --qkv-rank 3 --attn-out-rank 2 --ffn-rank 3 \
-  --use-rmsnorm --tie-qkv shareA_tieKV \
-  --train-steps 54000 --device cuda --seed 43
+  --run-name baseline_d8_s42_30k \
+  --d-model 8 --d-ff 28 \
+  --train-steps 30000 --device cuda --seed 42
 
-# 512-param model
+# Optional low-rank variant
 uv run python -m src.train \
-  --run-name best_512 \
+  --run-name rank_variant_s42 \
+  --d-model 7 --d-ff 14 \
   --pos-rank 3 --qkv-rank 3 --attn-out-rank 3 --ffn-rank 3 \
-  --device cuda --seed 42
+  --train-steps 54000 --device cuda --seed 42
 ```
 
 ## Training
@@ -104,9 +102,9 @@ uv run python -m src.train \
 3-phase curriculum following [gpt-acc-jax](https://github.com/yhavinga/gpt-acc-jax):
 1. Steps 0-2,000: 1-3 digit operands
 2. Steps 2,000-7,000: 1-6 digit operands
-3. Steps 7,000-54,000: 1-10 digit operands (full range)
+3. Steps 7,000-27,000: 1-10 digit operands (full range)
 
-AdamW optimizer, peak LR = 0.02, linear warmup (1,350 steps) + cosine decay, min LR = 0.002, weight decay = 0.01, batch size = 512, total steps = 54,000.
+AdamW optimizer, peak LR = 0.02, linear warmup (1,350 steps) + cosine decay, min LR = 0.002, weight decay = 0.01, batch size = 512, total steps = 27,000 by default.
 
 All successful models exhibit **grokking**: prolonged near-zero accuracy followed by a sudden phase transition. For the 456-parameter model, 2 out of 5 random seeds (43 and 44) grokked within 54K steps.
 
@@ -114,15 +112,12 @@ All successful models exhibit **grokking**: prolonged near-zero accuracy followe
 
 ```
 src/
-  model.py    # Low-rank transformer (RMSNorm, shareA_tieKV, LowRankLinear)
+  model.py    # Baseline transformer with optional rank factorization
   data.py     # Raw digit tokenization pipeline
   train.py    # Training with curriculum learning
   eval.py     # Evaluation and inference
-checkpoints/
-  best_456p_s43.pt   # Best model (456 params, 100% on 100K)
-  best_456p_s44.pt   # 456 params, 99.958% on 100K
-  best_512params.pt  # 512 params, 99.988% on 100K
-  best_582params.pt  # 582 params, 99.999% on 100K
+results/runs/<run_name>/checkpoints/
+  best.pt / last.pt   # Runtime checkpoints written by training
 evaluate_checkpoints.py  # Multi-seed evaluation script
 report.pdf               # Technical report
 ```

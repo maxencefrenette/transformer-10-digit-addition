@@ -1,4 +1,4 @@
-"""Training entrypoint for low-rank addition transformer.
+"""Training entrypoint for 10-digit addition transformer.
 
 Incorporates gpt-acc-jax techniques:
   - Curriculum learning (3 phases: 1-3 digits, 1-6 digits, 1-10 digits)
@@ -23,7 +23,6 @@ from typing import Dict, List, Optional, Tuple
 import torch
 
 from src.data import (
-    MAX_OPERAND,
     INPUT_LEN,
     VOCAB_SIZE,
     build_holdout_splits,
@@ -351,7 +350,7 @@ def train(model_cfg: ModelConfig, train_cfg: TrainConfig) -> Dict:
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="Train low-rank addition transformer")
+    p = argparse.ArgumentParser(description="Train addition transformer")
 
     # run/output
     p.add_argument("--run-name", type=str, default="lowrank_baseline")
@@ -375,19 +374,11 @@ def main() -> None:
     p.add_argument("--d-model", type=int, default=7)
     p.add_argument("--n-head", type=int, default=1)
     p.add_argument("--d-ff", type=int, default=14)
-    p.add_argument("--dropout", type=float, default=0.0)
     # low-rank options
     p.add_argument("--pos-rank", type=int, default=0, help="Position embedding rank (0=full)")
     p.add_argument("--qkv-rank", type=int, default=0, help="QKV projection rank (0=full)")
     p.add_argument("--attn-out-rank", type=int, default=0, help="Attn output rank (0=full)")
     p.add_argument("--ffn-rank", type=int, default=0, help="FFN rank (0=full)")
-    # normalization / tying
-    p.add_argument("--use-rmsnorm", action="store_true", default=False,
-                   help="Use RMSNorm instead of LayerNorm (saves d_model params per norm)")
-    p.add_argument("--tie-qkv", type=str, default="none",
-                   choices=["none", "all", "qk", "kv", "shareA", "shareB",
-                            "shareB_tieQK", "shareB_tieKV", "shareA_tieKV", "shareA_tieQK"],
-                   help="QKV tying mode")
 
 
     # optimization (gpt-acc-jax defaults)
@@ -415,15 +406,12 @@ def main() -> None:
         d_model=args.d_model,
         n_head=args.n_head,
         d_ff=args.d_ff,
-        dropout=args.dropout,
         max_seq_len=INPUT_LEN,
         vocab_size=VOCAB_SIZE,
         pos_rank=args.pos_rank,
         qkv_rank=args.qkv_rank,
         attn_out_rank=args.attn_out_rank,
         ffn_rank=args.ffn_rank,
-        use_rmsnorm=args.use_rmsnorm,
-        tie_qkv=args.tie_qkv,
     )
 
     run_dir = Path(args.run_dir)

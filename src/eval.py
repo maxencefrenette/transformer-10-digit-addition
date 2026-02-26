@@ -1,4 +1,4 @@
-"""Evaluation for the low-rank addition transformer."""
+"""Evaluation for the addition transformer."""
 
 import argparse
 import json
@@ -23,7 +23,7 @@ from src.model import ModelConfig, TinyDecoderLM
 
 def load_model_from_ckpt(ckpt_path: Path, device: torch.device) -> TinyDecoderLM:
     blob = torch.load(ckpt_path, map_location=device, weights_only=False)
-    mcfg = ModelConfig(**blob["model_config"])
+    mcfg = ModelConfig.from_dict(blob["model_config"])
     model = TinyDecoderLM(mcfg).to(device)
     model.load_state_dict(blob["model_state"])
     model.eval()
