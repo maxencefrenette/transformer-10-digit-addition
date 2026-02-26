@@ -230,3 +230,127 @@ find . -type f \( -path './checkpoints/*.pt' -o -path './results/runs/*/checkpoi
   - `ModelConfig.from_dict(...)` correctly drops removed legacy keys while keeping rank fields functional.
   - Embedding/output tying invariant holds (`tied=True`).
   - Saved checkpoint artifacts and `results/grokking_plot.png` were removed from the workspace.
+
+### Experiment E13: Shared-Depth Compute Scaling (Repeat Same Layer 2x)
+- Goal:
+  - Increase compute without increasing parameter count by reusing the same transformer block twice (`n_layer=2` with shared weights).
+- Code change:
+  - `TinyDecoderLM` now uses one shared `Block` and applies it `n_layer` times in forward pass.
+  - Parameter count stays fixed as `n_layer` increases.
+- Sanity check:
+```bash
+uv run python - <<'PY'
+from src.model import ModelConfig, TinyDecoderLM, count_parameters
+for n in [1, 2, 3]:
+    m = TinyDecoderLM(ModelConfig(n_layer=n, d_model=8, d_ff=28, n_head=1, max_seq_len=33, vocab_size=14))
+    print(n, count_parameters(m))
+PY
+```
+  - Output: `1 1128`, `2 1128`, `3 1128`.
+- Training command:
+```bash
+uv run python -m src.train \
+  --run-name baseline_d8_shared2_s42_30k \
+  --n-layer 2 --d-model 8 --d-ff 28 \
+  --pos-rank 0 --qkv-rank 0 --attn-out-rank 0 --ffn-rank 0 \
+  --lr 0.01 --train-steps 30000 --seed 42 --device mps --eval-interval 500
+```
+- Outputs:
+  - `results/runs/baseline_d8_shared2_s42_30k/summary.json`
+  - `results/runs/baseline_d8_shared2_s42_30k/metrics.csv`
+  - `results/runs/baseline_d8_shared2_s42_30k/checkpoints/best.pt`
+  - W&B run: `maxence-frenette/transformer-10-digit-addition/runs/lzf2rf8c`
+- Training findings:
+  - `params=1128` (unchanged from d8 baseline with `n_layer=1`).
+  - `best_val_exact=0.9984` at step `26500`.
+- Evaluation command:
+```bash
+uv run python evaluate_checkpoints.py \
+  results/runs/baseline_d8_shared2_s42_30k/checkpoints/best.pt \
+  --device mps --output results/baseline_d8_shared2_s42_30k_eval.json
+```
+- Evaluation findings:
+  - Aggregate exact match: `0.99825` (175 errors / 100,000).
+  - Per-seed exact match range: `0.9977` to `0.9986`.
+  - Compared to Experiment E10 (`n_layer=1` d8 baseline, `0.99967`), shared-depth 2x still works but is materially worse on held-out aggregate accuracy.
+
+### Experiment E14: Learning-Rate Sweep for Shared-Depth (`n_layer=2`)
+- Goal:
+  - Tune learning rate for the 2x repeated shared-layer baseline at fixed parameter count.
+- Setup:
+  - `n_layer=2`, `d_model=8`, `d_ff=28`, full-rank (`*_rank=0`), `train_steps=30000`, `seed=42`, `device=mps`, `eval_interval=500`.
+- Sweep commands:
+```bash
+uv run python -m src.train --run-name baseline_d8_shared2_lr0p006_s42_30k --n-layer 2 --d-model 8 --d-ff 28 --pos-rank 0 --qkv-rank 0 --attn-out-rank 0 --ffn-rank 0 --lr 0.006 --train-steps 30000 --seed 42 --device mps --eval-interval 500
+uv run python -m src.train --run-name baseline_d8_shared2_lr0p008_s42_30k --n-layer 2 --d-model 8 --d-ff 28 --pos-rank 0 --qkv-rank 0 --attn-out-rank 0 --ffn-rank 0 --lr 0.008 --train-steps 30000 --seed 42 --device mps --eval-interval 500
+uv run python -m src.train --run-name baseline_d8_shared2_lr0p01_s42_30k --n-layer 2 --d-model 8 --d-ff 28 --pos-rank 0 --qkv-rank 0 --attn-out-rank 0 --ffn-rank 0 --lr 0.01 --train-steps 30000 --seed 42 --device mps --eval-interval 500
+uv run python -m src.train --run-name baseline_d8_shared2_lr0p012_s42_30k --n-layer 2 --d-model 8 --d-ff 28 --pos-rank 0 --qkv-rank 0 --attn-out-rank 0 --ffn-rank 0 --lr 0.012 --train-steps 30000 --seed 42 --device mps --eval-interval 500
+uv run python -m src.train --run-name baseline_d8_shared2_lr0p015_s42_30k --n-layer 2 --d-model 8 --d-ff 28 --pos-rank 0 --qkv-rank 0 --attn-out-rank 0 --ffn-rank 0 --lr 0.015 --train-steps 30000 --seed 42 --device mps --eval-interval 500
+```
+- Evaluation command pattern:
+```bash
+uv run python evaluate_checkpoints.py \
+  results/runs/<run_name>/checkpoints/best.pt \
+  --device mps --output results/<run_name>_eval.json
+```
+- Outputs:
+  - `results/runs/baseline_d8_shared2_lr0p006_s42_30k/summary.json`
+  - `results/runs/baseline_d8_shared2_lr0p008_s42_30k/summary.json`
+  - `results/runs/baseline_d8_shared2_lr0p01_s42_30k/summary.json`
+  - `results/runs/baseline_d8_shared2_lr0p012_s42_30k/summary.json`
+  - `results/runs/baseline_d8_shared2_lr0p015_s42_30k/summary.json`
+  - `results/baseline_d8_shared2_lr0p006_s42_30k_eval.json`
+  - `results/baseline_d8_shared2_lr0p008_s42_30k_eval.json`
+  - `results/baseline_d8_shared2_lr0p01_s42_30k_eval.json`
+  - `results/baseline_d8_shared2_lr0p012_s42_30k_eval.json`
+  - `results/baseline_d8_shared2_lr0p015_s42_30k_eval.json`
+- Findings:
+  - `lr=0.006`: `best_val_exact=0.0116`, aggregate exact `0.01208` (98,792 errors / 100,000).
+  - `lr=0.008`: `best_val_exact=0.1114`, aggregate exact `0.09908` (90,092 errors / 100,000).
+  - `lr=0.010`: `best_val_exact=0.0114`, aggregate exact `0.00970` (99,030 errors / 100,000).
+  - `lr=0.012`: `best_val_exact=0.9828`, aggregate exact `0.97991` (2,009 errors / 100,000).
+  - `lr=0.015`: `best_val_exact=0.3176`, aggregate exact `0.32465` (67,535 errors / 100,000).
+- Conclusion:
+  - Best LR from this sweep is `0.012`.
+  - Training is unstable on MPS even with fixed seed (`lr=0.01` previously produced a strong run in E13 but collapsed in this sweep), so LR tuning should be paired with multi-seed repeats for robust selection.
+
+### Experiment E15: Learning-Rate Sweep for Regular 1-Layer Baseline (`n_layer=1`)
+- Goal:
+  - Run the same LR sweep as E14 for the regular 1-layer transformer and compare stability region width.
+- Setup:
+  - `n_layer=1`, `d_model=8`, `d_ff=28`, full-rank (`*_rank=0`), `train_steps=30000`, `seed=42`, `device=mps`, `eval_interval=500`.
+- Sweep commands:
+```bash
+uv run python -m src.train --run-name baseline_d8_layer1_lr0p006_s42_30k --n-layer 1 --d-model 8 --d-ff 28 --pos-rank 0 --qkv-rank 0 --attn-out-rank 0 --ffn-rank 0 --lr 0.006 --train-steps 30000 --seed 42 --device mps --eval-interval 500
+uv run python -m src.train --run-name baseline_d8_layer1_lr0p008_s42_30k --n-layer 1 --d-model 8 --d-ff 28 --pos-rank 0 --qkv-rank 0 --attn-out-rank 0 --ffn-rank 0 --lr 0.008 --train-steps 30000 --seed 42 --device mps --eval-interval 500
+uv run python -m src.train --run-name baseline_d8_layer1_lr0p01_s42_30k --n-layer 1 --d-model 8 --d-ff 28 --pos-rank 0 --qkv-rank 0 --attn-out-rank 0 --ffn-rank 0 --lr 0.01 --train-steps 30000 --seed 42 --device mps --eval-interval 500
+uv run python -m src.train --run-name baseline_d8_layer1_lr0p012_s42_30k --n-layer 1 --d-model 8 --d-ff 28 --pos-rank 0 --qkv-rank 0 --attn-out-rank 0 --ffn-rank 0 --lr 0.012 --train-steps 30000 --seed 42 --device mps --eval-interval 500
+uv run python -m src.train --run-name baseline_d8_layer1_lr0p015_s42_30k --n-layer 1 --d-model 8 --d-ff 28 --pos-rank 0 --qkv-rank 0 --attn-out-rank 0 --ffn-rank 0 --lr 0.015 --train-steps 30000 --seed 42 --device mps --eval-interval 500
+```
+- Evaluation command pattern:
+```bash
+uv run python evaluate_checkpoints.py \
+  results/runs/<run_name>/checkpoints/best.pt \
+  --device mps --output results/<run_name>_eval.json
+```
+- Outputs:
+  - `results/runs/baseline_d8_layer1_lr0p006_s42_30k/summary.json`
+  - `results/runs/baseline_d8_layer1_lr0p008_s42_30k/summary.json`
+  - `results/runs/baseline_d8_layer1_lr0p01_s42_30k/summary.json`
+  - `results/runs/baseline_d8_layer1_lr0p012_s42_30k/summary.json`
+  - `results/runs/baseline_d8_layer1_lr0p015_s42_30k/summary.json`
+  - `results/baseline_d8_layer1_lr0p006_s42_30k_eval.json`
+  - `results/baseline_d8_layer1_lr0p008_s42_30k_eval.json`
+  - `results/baseline_d8_layer1_lr0p01_s42_30k_eval.json`
+  - `results/baseline_d8_layer1_lr0p012_s42_30k_eval.json`
+  - `results/baseline_d8_layer1_lr0p015_s42_30k_eval.json`
+- Findings:
+  - `lr=0.006`: `best_val_exact=0.0`, aggregate exact `0.00000` (100,000 errors / 100,000).
+  - `lr=0.008`: `best_val_exact=0.0006`, aggregate exact `0.00017` (99,983 errors / 100,000).
+  - `lr=0.010`: `best_val_exact=0.0`, aggregate exact `0.00000` (100,000 errors / 100,000).
+  - `lr=0.012`: `best_val_exact=1.0`, aggregate exact `0.99960` (40 errors / 100,000).
+  - `lr=0.015`: `best_val_exact=1.0`, aggregate exact `0.99999` (1 error / 100,000).
+- Stability comparison vs E14 (`n_layer=2`):
+  - Shared-2 best was `lr=0.012` with aggregate exact `0.97991`; `lr=0.015` degraded to `0.32465`.
+  - Regular 1-layer reaches near-perfect performance at both `lr=0.012` and `lr=0.015`.
+  - In this sweep, the high-performing LR region is larger for `n_layer=1` than for `n_layer=2`.
