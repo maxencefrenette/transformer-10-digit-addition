@@ -129,9 +129,30 @@ uv run python -m src.train \
   - Best validation exact match during training: `0.0002` at step `19000`.
   - Held-out aggregate exact match: `0.00002` (99,998 errors / 100,000).
 
+### Experiment E10: d=8 Baseline from ~973 Setup (30k steps, Seed 42)
+- Command:
+```bash
+uv run python -m src.train \
+  --run-name baseline_d8_from_973_s42_30k \
+  --d-model 8 --d-ff 28 \
+  --pos-rank 0 --qkv-rank 0 --attn-out-rank 0 --ffn-rank 0 \
+  --lr 0.01 --train-steps 30000 --seed 42 --device mps --eval-interval 500
+```
+- Outputs:
+  - `results/runs/baseline_d8_from_973_s42_30k/summary.json`
+  - `results/runs/baseline_d8_from_973_s42_30k/metrics.csv`
+  - `results/baseline_d8_from_973_s42_30k_eval.json`
+  - W&B run: `maxence-frenette/transformer-10-digit-addition/runs/qjs0xesr`
+- Findings:
+  - Model size in this codebase is `1128` params.
+  - Best validation exact match during training: `1.0` (first reached at step `8500`).
+  - Training mostly remained at `val_exact=1.0` through 30k, with brief transient drops.
+  - Held-out aggregate exact match: `0.99967` (33 errors / 100,000).
+
 ### Conclusion
 - Reproduction training attempts with seeds 43 and 44 on `mps` did not reproduce the published 100% result.
 - Evaluation pipeline is valid locally (provided checkpoint reproduces expected 100%).
 - 512-parameter baseline training also failed to reproduce on `mps`, while the provided 512 checkpoint evaluates as expected.
 - Extending the 512 baseline to 100k steps on `mps` still failed to produce a strong grokking solution.
 - 763-param and 959-param baseline attempts also failed to reach reliable exact-match accuracy on `mps`.
+- Increasing the baseline to `d_model=8` (1128 params) produced a robust high-accuracy run on `mps` (`0.99967` aggregate exact match).
