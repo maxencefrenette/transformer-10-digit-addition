@@ -593,3 +593,49 @@ uv run python evaluate_checkpoints.py \
     - aggregate exact `0.0009` (99,910 errors / 100,000)
 - Conclusion:
   - Removing normalization entirely is unstable and unsuccessful in this baseline regime on this hardware (0/3 successful seeds).
+
+### Experiment E21: Lower Positional Embedding Rank to 6 (`pos_rank=6`, 3 seeds)
+- Goal:
+  - Test whether lowering positional embedding rank to `6` remains reliable under the current baseline setup.
+- Setup:
+  - `n_layer=1`, `d_model=8`, `d_ff=28`, `n_head=1`
+  - `pos_rank=6`, `qkv_rank=0`, `attn_out_rank=0`, `ffn_rank=3`
+  - `fixed_full_rank=true`, `lr=0.015`, `train_steps=30000`, `device=mps`, `eval_interval=500`
+  - seeds: `42`, `43`, `44`
+- Commands (pattern):
+```bash
+uv run python -m src.train \
+  --run-name posrank6_fixed1_ffnr3_s{SEED}_30k \
+  --n-layer 1 --d-model 8 --d-ff 28 \
+  --pos-rank 6 --qkv-rank 0 --attn-out-rank 0 --ffn-rank 3 \
+  --fixed-full-rank \
+  --lr 0.015 --train-steps 30000 --seed {SEED} --device mps --eval-interval 500
+
+uv run python evaluate_checkpoints.py \
+  results/runs/posrank6_fixed1_ffnr3_s{SEED}_30k/checkpoints/best.pt \
+  --device mps --output results/posrank6_fixed1_ffnr3_s{SEED}_30k_eval.json
+```
+- Outputs:
+  - `results/runs/posrank6_fixed1_ffnr3_s42_30k/summary.json`
+  - `results/runs/posrank6_fixed1_ffnr3_s43_30k/summary.json`
+  - `results/runs/posrank6_fixed1_ffnr3_s44_30k/summary.json`
+  - `results/posrank6_fixed1_ffnr3_s42_30k_eval.json`
+  - `results/posrank6_fixed1_ffnr3_s43_30k_eval.json`
+  - `results/posrank6_fixed1_ffnr3_s44_30k_eval.json`
+  - W&B runs:
+    - `maxence-frenette/transformer-10-digit-addition/runs/axxpl9vl`
+    - `maxence-frenette/transformer-10-digit-addition/runs/adbcbgfv`
+    - `maxence-frenette/transformer-10-digit-addition/runs/mvi1x4jn`
+- Findings:
+  - All runs used `878` parameters.
+  - Seed 42:
+    - `best_val_exact=0.5916` (step `29999`)
+    - aggregate exact `0.59502` (40,498 errors / 100,000)
+  - Seed 43:
+    - `best_val_exact=1.0` (step `15000`)
+    - aggregate exact `0.99993` (7 errors / 100,000)
+  - Seed 44:
+    - `best_val_exact=1.0` (step `24500`)
+    - aggregate exact `0.99986` (14 errors / 100,000)
+- Conclusion:
+  - `pos_rank=6` can reach near-perfect performance, but remains seed-sensitive in this setup (2 strong seeds, 1 partial-failure seed).
