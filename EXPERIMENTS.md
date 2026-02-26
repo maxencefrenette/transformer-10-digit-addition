@@ -503,3 +503,93 @@ uv run python evaluate_checkpoints.py \
     - mean aggregate errors: `2.33`
 - Conclusion:
   - For this `ffn_rank=3` setup, enabling `fixed_full_rank` is decisively better and robust across all three tested seeds.
+
+### Experiment E19: Replace LayerNorm with RMSNorm (`fixed_full_rank=true`, `ffn_rank=3`, 3 seeds)
+- Goal:
+  - Replace all model LayerNorms with RMSNorm and test training on 3 seeds.
+- Code change:
+  - `src/model.py`: added `RMSNorm` and replaced `ln1`, `ln2`, and `ln_f`.
+  - Parameter count changed from `896` to `872` (RMSNorm has scale only, no bias).
+- Setup:
+  - `n_layer=1`, `d_model=8`, `d_ff=28`, `n_head=1`
+  - `pos_rank=0`, `qkv_rank=0`, `attn_out_rank=0`, `ffn_rank=3`
+  - `fixed_full_rank=true`, `lr=0.015`, `train_steps=30000`, `device=mps`, `eval_interval=500`
+  - seeds: `42`, `43`, `44`
+- Commands (pattern):
+```bash
+uv run python -m src.train \
+  --run-name rmsnorm_fixed1_ffnr3_s{SEED}_30k \
+  --n-layer 1 --d-model 8 --d-ff 28 \
+  --pos-rank 0 --qkv-rank 0 --attn-out-rank 0 --ffn-rank 3 \
+  --fixed-full-rank \
+  --lr 0.015 --train-steps 30000 --seed {SEED} --device mps --eval-interval 500
+
+uv run python evaluate_checkpoints.py \
+  results/runs/rmsnorm_fixed1_ffnr3_s{SEED}_30k/checkpoints/best.pt \
+  --device mps --output results/rmsnorm_fixed1_ffnr3_s{SEED}_30k_eval.json
+```
+- Outputs:
+  - `results/runs/rmsnorm_fixed1_ffnr3_s42_30k/summary.json`
+  - `results/runs/rmsnorm_fixed1_ffnr3_s43_30k/summary.json`
+  - `results/runs/rmsnorm_fixed1_ffnr3_s44_30k/summary.json`
+  - `results/rmsnorm_fixed1_ffnr3_s42_30k_eval.json`
+  - `results/rmsnorm_fixed1_ffnr3_s43_30k_eval.json`
+  - `results/rmsnorm_fixed1_ffnr3_s44_30k_eval.json`
+- Findings:
+  - Seed 42:
+    - `best_val_exact=0.0` (step `0`)
+    - aggregate exact `0.0` (100,000 errors / 100,000)
+  - Seed 43:
+    - `best_val_exact=0.0116` (step `28000`)
+    - aggregate exact `0.00899` (99,101 errors / 100,000)
+  - Seed 44:
+    - `best_val_exact=1.0` (step `17500`)
+    - aggregate exact `0.99997` (3 errors / 100,000)
+- Conclusion:
+  - RMSNorm in this setup is highly seed-sensitive on this hardware: 1 strong seed, 2 failed seeds.
+
+### Experiment E20: Remove Normalization Completely (`fixed_full_rank=true`, `ffn_rank=3`, 3 seeds)
+- Goal:
+  - Remove normalization from all blocks and the final layer, then test 3 seeds.
+- Code change:
+  - `src/model.py`:
+    - Replaced `ln1`, `ln2`, and `ln_f` with `nn.Identity()`.
+    - Removed `RMSNorm` usage entirely.
+  - Parameter count changed from `872` (RMSNorm variant) to `848`.
+- Setup:
+  - `n_layer=1`, `d_model=8`, `d_ff=28`, `n_head=1`
+  - `pos_rank=0`, `qkv_rank=0`, `attn_out_rank=0`, `ffn_rank=3`
+  - `fixed_full_rank=true`, `lr=0.015`, `train_steps=30000`, `device=mps`, `eval_interval=500`
+  - seeds: `42`, `43`, `44`
+- Commands (pattern):
+```bash
+uv run python -m src.train \
+  --run-name nonorm_fixed1_ffnr3_s{SEED}_30k \
+  --n-layer 1 --d-model 8 --d-ff 28 \
+  --pos-rank 0 --qkv-rank 0 --attn-out-rank 0 --ffn-rank 3 \
+  --fixed-full-rank \
+  --lr 0.015 --train-steps 30000 --seed {SEED} --device mps --eval-interval 500
+
+uv run python evaluate_checkpoints.py \
+  results/runs/nonorm_fixed1_ffnr3_s{SEED}_30k/checkpoints/best.pt \
+  --device mps --output results/nonorm_fixed1_ffnr3_s{SEED}_30k_eval.json
+```
+- Outputs:
+  - `results/runs/nonorm_fixed1_ffnr3_s42_30k/summary.json`
+  - `results/runs/nonorm_fixed1_ffnr3_s43_30k/summary.json`
+  - `results/runs/nonorm_fixed1_ffnr3_s44_30k/summary.json`
+  - `results/nonorm_fixed1_ffnr3_s42_30k_eval.json`
+  - `results/nonorm_fixed1_ffnr3_s43_30k_eval.json`
+  - `results/nonorm_fixed1_ffnr3_s44_30k_eval.json`
+- Findings:
+  - Seed 42:
+    - `best_val_exact=0.0` (step `0`)
+    - aggregate exact `0.0` (100,000 errors / 100,000)
+  - Seed 43:
+    - `best_val_exact=0.0002` (step `22000`)
+    - aggregate exact `0.0` (100,000 errors / 100,000)
+  - Seed 44:
+    - `best_val_exact=0.0018` (step `10000`)
+    - aggregate exact `0.0009` (99,910 errors / 100,000)
+- Conclusion:
+  - Removing normalization entirely is unstable and unsuccessful in this baseline regime on this hardware (0/3 successful seeds).
