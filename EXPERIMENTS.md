@@ -692,3 +692,63 @@ uv run python evaluate_checkpoints.py \
 - Conclusion:
   - Applying the fixed full-rank residual to low-rank positional embeddings significantly degraded this `pos_rank=6` setup on all 3 seeds.
   - Compared with E21 (same hyperparameters except this embedding change), performance regressed from 2/3 near-perfect seeds to 0/3 successful seeds.
+
+### Experiment E23: Split Positional Embedding `A` into 4 Trainable + 2 Fixed Random Weights (`pos_rank=6`, `pos_fixed_a_rank=2`, 3 seeds)
+- Goal:
+  - Keep low-rank positional embedding at rank 6, but make each row of `A` use 4 trainable values and 2 non-trainable random values.
+- Code change:
+  - `src/model.py`:
+    - Added `pos_fixed_a_rank` to `ModelConfig`.
+    - Updated `LowRankEmbedding` to use:
+      - trainable `A` with shape `(num_embeddings, rank - fixed_a_rank)`
+      - non-trainable buffer `A_fixed` with shape `(num_embeddings, fixed_a_rank)`
+      - trainable `B` with shape `(rank, embedding_dim)`
+    - Forward now computes `concat(A[idx], A_fixed[idx]) @ B`.
+    - `TinyDecoderLM` now passes `fixed_a_rank=cfg.pos_fixed_a_rank` for low-rank positional embeddings.
+  - `src/train.py`:
+    - Added CLI flag `--pos-fixed-a-rank` and validation (`<= --pos-rank`).
+  - `evaluate_checkpoints.py`:
+    - Added `pos_fixed_a_rank` to output config metadata.
+- Setup:
+  - `n_layer=1`, `d_model=8`, `d_ff=28`, `n_head=1`
+  - `pos_rank=6`, `pos_fixed_a_rank=2`, `qkv_rank=0`, `attn_out_rank=0`, `ffn_rank=3`
+  - `fixed_full_rank=true`, `lr=0.015`, `train_steps=30000`, `device=mps`, `eval_interval=500`
+  - seeds: `42`, `43`, `44`
+- Commands (pattern):
+```bash
+uv run python -m src.train \
+  --run-name posrank6_afixed2_fixed1_ffnr3_s{SEED}_30k \
+  --n-layer 1 --d-model 8 --d-ff 28 \
+  --pos-rank 6 --pos-fixed-a-rank 2 \
+  --qkv-rank 0 --attn-out-rank 0 --ffn-rank 3 \
+  --fixed-full-rank \
+  --lr 0.015 --train-steps 30000 --seed {SEED} --device mps --eval-interval 500
+
+uv run python evaluate_checkpoints.py \
+  results/runs/posrank6_afixed2_fixed1_ffnr3_s{SEED}_30k/checkpoints/best.pt \
+  --device mps --output results/posrank6_afixed2_fixed1_ffnr3_s{SEED}_30k_eval.json
+```
+- Outputs:
+  - `results/runs/posrank6_afixed2_fixed1_ffnr3_s42_30k/summary.json`
+  - `results/runs/posrank6_afixed2_fixed1_ffnr3_s43_30k/summary.json`
+  - `results/runs/posrank6_afixed2_fixed1_ffnr3_s44_30k/summary.json`
+  - `results/posrank6_afixed2_fixed1_ffnr3_s42_30k_eval.json`
+  - `results/posrank6_afixed2_fixed1_ffnr3_s43_30k_eval.json`
+  - `results/posrank6_afixed2_fixed1_ffnr3_s44_30k_eval.json`
+  - W&B runs:
+    - `maxence-frenette/transformer-10-digit-addition/runs/efehhwdh`
+    - `maxence-frenette/transformer-10-digit-addition/runs/e49jnkfa`
+    - `maxence-frenette/transformer-10-digit-addition/runs/48xk0ayr`
+- Findings:
+  - All runs used `812` parameters.
+  - Seed 42:
+    - `best_val_exact=0.0` (step `0`)
+    - aggregate exact `0.0` (100,000 errors / 100,000)
+  - Seed 43:
+    - `best_val_exact=0.0` (step `0`)
+    - aggregate exact `0.0` (100,000 errors / 100,000)
+  - Seed 44:
+    - `best_val_exact=0.1084` (step `25000`)
+    - aggregate exact `0.09949` (90,051 errors / 100,000)
+- Conclusion:
+  - This clean 4-trainable/2-fixed `A` split for positional embeddings underperformed strongly on this setup (0/3 successful seeds).
