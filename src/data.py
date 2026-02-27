@@ -42,6 +42,7 @@ FULL_LEN = PROMPT_LEN + TARGET_LEN  # 34
 
 POW10_10 = torch.tensor([10**i for i in range(NUM_DIGITS)], dtype=torch.int64)
 POW10_11 = torch.tensor([10**i for i in range(SUM_DIGITS)], dtype=torch.int64)
+POW10_10_MSD = torch.tensor([10 ** (NUM_DIGITS - 1 - j) for j in range(NUM_DIGITS)], dtype=torch.int64)
 
 
 # ---------------------------------------------------------------------------
@@ -89,37 +90,37 @@ def postprocess(generated: Sequence[int]) -> int:
 # Vectorized batch encoding
 # ---------------------------------------------------------------------------
 def preprocess_batch(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    """Vectorized: (a, b) int64 tensors -> prompt token tensor [bsz, PROMPT_LEN=22]."""
-    bsz = a.shape[0]
-    # Extract digits MSD-first: position j -> digit at 10^(NUM_DIGITS-1-j)
-    powers = torch.tensor(
-        [10 ** (NUM_DIGITS - 1 - j) for j in range(NUM_DIGITS)], dtype=torch.int64
-    )
-    a_digits = ((a[:, None] // powers[None, :]) % 10).to(torch.long)
-    b_digits = ((b[:, None] // powers[None, :]) % 10).to(torch.long)
+    """Vectorized: (a, b) -> prompt token tensor [..., PROMPT_LEN=22]."""
+    if a.shape != b.shape:
+        raise ValueError(f"a and b must have the same shape, got {tuple(a.shape)} vs {tuple(b.shape)}")
+    powers = POW10_10_MSD.to(a.device)
+    a_digits = ((a.unsqueeze(-1) // powers) % 10).to(torch.long)
+    b_digits = ((b.unsqueeze(-1) // powers) % 10).to(torch.long)
 
-    plus = torch.full((bsz, 1), PLUS_ID, dtype=torch.long)
-    eq = torch.full((bsz, 1), EQUALS_ID, dtype=torch.long)
-    return torch.cat([a_digits, plus, b_digits, eq], dim=1)  # [bsz, 22]
+    pad_shape = a.shape + (1,)
+    plus = torch.full(pad_shape, PLUS_ID, dtype=torch.long, device=a.device)
+    eq = torch.full(pad_shape, EQUALS_ID, dtype=torch.long, device=a.device)
+    return torch.cat([a_digits, plus, b_digits, eq], dim=-1)
 
 
 def encode_batch(
     a: torch.Tensor, b: torch.Tensor
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Build supervised LM tensors (x, y) with prompt labels masked."""
-    prompt = preprocess_batch(a, b)  # [bsz, 22]
+    if a.shape != b.shape:
+        raise ValueError(f"a and b must have the same shape, got {tuple(a.shape)} vs {tuple(b.shape)}")
+    prompt = preprocess_batch(a, b)  # [..., 22]
     sums = a + b
     # Reversed sum digits (LSD first)
-    sum_digits = ((sums[:, None] // POW10_11[None, :]) % 10).to(torch.long)
+    sum_digits = ((sums.unsqueeze(-1) // POW10_11.to(sums.device)) % 10).to(torch.long)
 
-    bsz = a.shape[0]
-    eos = torch.full((bsz, 1), EOS_ID, dtype=torch.long)
-    target = torch.cat([sum_digits, eos], dim=1)  # [bsz, 12]
+    eos = torch.full(a.shape + (1,), EOS_ID, dtype=torch.long, device=a.device)
+    target = torch.cat([sum_digits, eos], dim=-1)  # [..., 12]
 
-    full = torch.cat([prompt, target], dim=1)  # [bsz, 34]
-    x = full[:, :-1].clone()  # [bsz, 33]
-    y = full[:, 1:].clone()   # [bsz, 33]
-    y[:, : PROMPT_LEN - 1] = -100  # mask prompt tokens in labels
+    full = torch.cat([prompt, target], dim=-1)  # [..., 34]
+    x = full[..., :-1].clone()  # [..., 33]
+    y = full[..., 1:].clone()   # [..., 33]
+    y[..., : PROMPT_LEN - 1] = -100  # mask prompt tokens in labels
     return x, y
 
 

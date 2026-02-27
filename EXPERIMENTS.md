@@ -1290,3 +1290,172 @@ done
 - Conclusion:
   - Best configuration in the requested sweep: **`batch_size=384, lr=0.0165` with `6/8` success**, improving over baseline `3/8`.
   - Secondary viable configuration: `batch_size=512, lr=0.0150` with `4/8`.
+
+### Experiment E36: Runtime Bottleneck Profiling for `num_models=8`
+- Goal:
+  - Measure where wall-clock time goes for vectorized 8-model training.
+- Command:
+```bash
+uv run python - <<'PY'
+import time, torch
+from pathlib import Path
+from src.model import ModelConfig, TinyDecoderLM
+from src.train import CurriculumBatchSampler, CURRICULUM_PHASES, clip_grad_norm_per_model
+from src.eval import evaluate_exact_match_multi
+from src.data import build_holdout_splits, pair_hash, encode_batch
+
+cfg = ModelConfig(num_models=8)
+model = TinyDecoderLM(cfg).to('mps')
+opt = torch.optim.AdamW(model.parameters(), lr=0.015, weight_decay=0.01)
+
+val_size=5000
+test_size=10000
+val_a=[]; val_b=[]; reserved=[]
+for i in range(cfg.num_models):
+    sp = build_holdout_splits(val_size, test_size, 42+i, Path(f'results/data/holdout_v{val_size}_t{test_size}_seed{42+i}.pt'))
+    va=sp['val_a']; vb=sp['val_b']
+    val_a.append(va); val_b.append(vb)
+    rs=set()
+    for ai,bi in zip(va.tolist(),vb.tolist()): rs.add(pair_hash(int(ai),int(bi)))
+    for ai,bi in zip(sp['test_a'].tolist(),sp['test_b'].tolist()): rs.add(pair_hash(int(ai),int(bi)))
+    reserved.append(rs)
+
+samplers=[CurriculumBatchSampler(512, 1337+i, reserved[i], CURRICULUM_PHASES) for i in range(cfg.num_models)]
+
+def do_sample(step=20000):
+    a=[]; b=[]
+    for s in samplers:
+        ai,bi=s.sample_operands(step)
+        a.append(ai); b.append(bi)
+    a=torch.stack(a,0); b=torch.stack(b,0)
+    x,y=encode_batch(a,b)
+    return x,y
+
+def do_step(x,y):
+    x=x.to('mps'); y=y.to('mps')
+    opt.zero_grad(set_to_none=True)
+    _,loss,_ = model(x,y,return_per_model_loss=True)
+    loss.backward()
+    clip_grad_norm_per_model(model.parameters(), 1.0, cfg.num_models)
+    opt.step()
+
+for _ in range(10):
+    x,y = do_sample(); do_step(x,y)
+
+torch.mps.synchronize()
+t0=time.time()
+for _ in range(20):
+    _x,_y = do_sample()
+torch.mps.synchronize()
+sample_sec=time.time()-t0
+
+x,y = do_sample()
+torch.mps.synchronize()
+t0=time.time()
+for _ in range(20):
+    do_step(x,y)
+torch.mps.synchronize()
+step_sec=time.time()-t0
+
+torch.mps.synchronize()
+t0=time.time()
+em,tok = evaluate_exact_match_multi(model, val_a, val_b, 512, torch.device('mps'))
+torch.mps.synchronize()
+eval_sec=time.time()-t0
+
+print('sample_sec_total',sample_sec,'sample_sec_per_iter',sample_sec/20)
+print('step_sec_total',step_sec,'step_sec_per_iter',step_sec/20)
+print('eval_sec_full',eval_sec)
+print('val_exact_mean',sum(em)/len(em),'val_tok_mean',sum(tok)/len(tok))
+PY
+```
+- Outputs:
+  - Profiling numbers printed to stdout (no artifact file).
+- Findings:
+  - `sample_sec_per_iter = 0.00118s`
+  - `step_sec_per_iter = 0.03369s`
+  - `eval_sec_full = 1.4390s` (full validation across all 8 models)
+  - Bottleneck is training-step compute, with sampling overhead now much smaller.
+- Conclusion:
+  - The remaining dominant cost is model forward/backward/optimizer on MPS; further gains will require numerical/algorithmic tradeoffs (precision, eval cadence, logging cadence, or compile strategy).
+
+### Experiment E37: End-to-End 500-Step Runtime Benchmark After Speed Optimizations
+- Goal:
+  - Validate real wall-clock impact of the runtime optimization changes for `num_models=8`.
+- Command:
+```bash
+uv run python -m src.train \
+  --device mps \
+  --wandb-mode disabled \
+  --run-name bench_num8_speedopt_s42_500 \
+  --run-dir results/runs/bench_num8_speedopt_s42_500 \
+  --train-steps 500 \
+  --eval-interval 500 \
+  --batch-size 512 \
+  --lr 0.015 \
+  --seed 42
+```
+- Outputs:
+  - `results/runs/bench_num8_speedopt_s42_500/summary.json`
+  - `results/runs/bench_num8_speedopt_s42_500/model_000/metrics.csv`
+  - `results/runs/bench_num8_speedopt_s42_500/model_001/metrics.csv`
+  - `results/runs/bench_num8_speedopt_s42_500/model_002/metrics.csv`
+  - `results/runs/bench_num8_speedopt_s42_500/model_003/metrics.csv`
+  - `results/runs/bench_num8_speedopt_s42_500/model_004/metrics.csv`
+  - `results/runs/bench_num8_speedopt_s42_500/model_005/metrics.csv`
+  - `results/runs/bench_num8_speedopt_s42_500/model_006/metrics.csv`
+  - `results/runs/bench_num8_speedopt_s42_500/model_007/metrics.csv`
+- Follow-up command (sampler correctness-preserving variant):
+```bash
+uv run python -m src.train \
+  --device mps \
+  --wandb-mode disabled \
+  --run-name bench_num8_speedopt_v2_s42_500 \
+  --run-dir results/runs/bench_num8_speedopt_v2_s42_500 \
+  --train-steps 500 \
+  --eval-interval 500 \
+  --batch-size 512 \
+  --lr 0.015 \
+  --seed 42
+```
+- Follow-up outputs:
+  - `results/runs/bench_num8_speedopt_v2_s42_500/summary.json`
+  - `results/runs/bench_num8_speedopt_v2_s42_500/model_000/metrics.csv`
+  - `results/runs/bench_num8_speedopt_v2_s42_500/model_001/metrics.csv`
+  - `results/runs/bench_num8_speedopt_v2_s42_500/model_002/metrics.csv`
+  - `results/runs/bench_num8_speedopt_v2_s42_500/model_003/metrics.csv`
+  - `results/runs/bench_num8_speedopt_v2_s42_500/model_004/metrics.csv`
+  - `results/runs/bench_num8_speedopt_v2_s42_500/model_005/metrics.csv`
+  - `results/runs/bench_num8_speedopt_v2_s42_500/model_006/metrics.csv`
+  - `results/runs/bench_num8_speedopt_v2_s42_500/model_007/metrics.csv`
+- 3-seed timing commands (same settings, seeds 43 and 44):
+```bash
+for seed in 43 44; do
+  run_name="bench_num8_speedopt_v2_s${seed}_500"
+  uv run python -m src.train \
+    --device mps \
+    --wandb-mode disabled \
+    --run-name "${run_name}" \
+    --run-dir "results/runs/${run_name}" \
+    --train-steps 500 \
+    --eval-interval 500 \
+    --batch-size 512 \
+    --lr 0.015 \
+    --seed "${seed}"
+done
+```
+- 3-seed additional outputs:
+  - `results/runs/bench_num8_speedopt_v2_s43_500/summary.json`
+  - `results/runs/bench_num8_speedopt_v2_s44_500/summary.json`
+- Findings:
+  - `elapsed_sec = 19.7193` for 500 steps (`bench_num8_speedopt_s42_500`).
+  - `elapsed_sec = 19.4721` for 500 steps (`bench_num8_speedopt_v2_s42_500`).
+  - `elapsed_sec = 19.6068` for 500 steps (`bench_num8_speedopt_v2_s43_500`).
+  - `elapsed_sec = 19.8226` for 500 steps (`bench_num8_speedopt_v2_s44_500`).
+  - `bench_num8_speedopt_v2_*` 3-seed mean wall-clock: `19.6338s` per 500 steps.
+  - Previous baseline-family timing reference (`sweep_num8_bs512_lr0p0150_s42_30k`, model_000): `33.2019s` for one 500-step window (`step 0 -> step 500`).
+  - Optimized timing (`bench_num8_speedopt_v2_s42_500`, model_000): `17.7391s` for one 499-step window (`step 0 -> step 499`).
+  - Approximate runtime reduction versus previous reference: `~46.6%` (`1.87x` faster).
+  - Compared with previous observed ~`33s` per 500-step window in this config family, this is a substantial speedup.
+- Conclusion:
+  - Runtime optimization succeeded; 8-model experiments now complete markedly faster with unchanged model shape/parameter count.

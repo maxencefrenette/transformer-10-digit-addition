@@ -89,6 +89,7 @@ class ModelEmbedding(nn.Module):
         super().__init__()
         self.num_models = num_models
         self.weight = nn.Parameter(torch.empty(num_models, num_embeddings, embedding_dim))
+        self.register_buffer("_model_idx", torch.arange(num_models, dtype=torch.long), persistent=False)
         nn.init.normal_(self.weight, mean=0.0, std=0.02)
 
     def forward(self, idx: torch.Tensor) -> torch.Tensor:
@@ -99,7 +100,7 @@ class ModelEmbedding(nn.Module):
             raise ValueError(
                 f"idx model axis ({idx.shape[0]}) must equal num_models ({self.num_models})"
             )
-        midx = torch.arange(self.num_models, device=idx.device).view(self.num_models, 1, 1)
+        midx = self._model_idx.view(self.num_models, 1, 1)
         return self.weight[midx, idx]
 
 
@@ -111,6 +112,7 @@ class LowRankEmbedding(nn.Module):
         self.num_models = num_models
         self.A = nn.Parameter(torch.empty(num_models, num_embeddings, rank))
         self.B = nn.Parameter(torch.empty(num_models, rank, embedding_dim))
+        self.register_buffer("_model_idx", torch.arange(num_models, dtype=torch.long), persistent=False)
         nn.init.normal_(self.A, std=0.02)
         nn.init.normal_(self.B, std=0.02)
 
@@ -122,7 +124,7 @@ class LowRankEmbedding(nn.Module):
             raise ValueError(
                 f"idx model axis ({idx.shape[0]}) must equal num_models ({self.num_models})"
             )
-        midx = torch.arange(self.num_models, device=idx.device).view(self.num_models, 1, 1)
+        midx = self._model_idx.view(self.num_models, 1, 1)
         a_rows = self.A[midx, idx]  # [m, b, t, r]
         return torch.einsum("mbtr,mrd->mbtd", a_rows, self.B)
 
@@ -213,11 +215,20 @@ class CausalSelfAttention(nn.Module):
         k = k.view(msz, bsz, seqlen, self.n_head, self.head_dim).permute(0, 1, 3, 2, 4)
         v = v.view(msz, bsz, seqlen, self.n_head, self.head_dim).permute(0, 1, 3, 2, 4)
 
-        att = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        att = att.masked_fill(~self.mask[:seqlen, :seqlen], float("-inf"))
-        att = F.softmax(att, dim=-1)
+        q = q.reshape(msz * bsz, self.n_head, seqlen, self.head_dim)
+        k = k.reshape(msz * bsz, self.n_head, seqlen, self.head_dim)
+        v = v.reshape(msz * bsz, self.n_head, seqlen, self.head_dim)
 
-        y = (att @ v).permute(0, 1, 3, 2, 4).contiguous().view(msz, bsz, seqlen, d_model)
+        if hasattr(F, "scaled_dot_product_attention"):
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        else:
+            att = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            att = att.masked_fill(~self.mask[:seqlen, :seqlen], float("-inf"))
+            att = F.softmax(att, dim=-1)
+            y = att @ v
+
+        y = y.view(msz, bsz, self.n_head, seqlen, self.head_dim)
+        y = y.permute(0, 1, 3, 2, 4).contiguous().view(msz, bsz, seqlen, d_model)
         return self.proj(y)
 
 
@@ -325,6 +336,7 @@ class TinyDecoderLM(nn.Module):
         self.blocks = nn.ModuleList([Block(cfg) for _ in range(cfg.n_layer)])
         self.ln_f = ModelLayerNorm(cfg.num_models, cfg.d_model)
         self.lm_head = TiedLMHead(self.token_emb)
+        self.register_buffer("pos_ids", torch.arange(cfg.max_seq_len, dtype=torch.long), persistent=False)
 
     def _prepare_idx(self, idx: torch.Tensor) -> Tuple[torch.Tensor, bool]:
         """Normalize input to [m,b,t]. Returns (idx3d, squeeze_back)."""
@@ -352,8 +364,7 @@ class TinyDecoderLM(nn.Module):
         idx3, squeeze_back = self._prepare_idx(idx)
         msz, bsz, seqlen = idx3.shape
 
-        pos = torch.arange(seqlen, device=idx3.device).view(1, 1, seqlen)
-        pos = pos.expand(msz, bsz, seqlen)
+        pos = self.pos_ids[:seqlen].view(1, 1, seqlen).expand(msz, bsz, seqlen)
 
         x = self.token_emb(idx3) + self.pos_emb(pos)
 

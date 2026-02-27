@@ -106,19 +106,12 @@ def evaluate_exact_match_multi(
     for start in range(0, n, batch_size):
         end = min(start + batch_size, n)
 
-        prompts = []
-        tgt_digits = []
-        for m in range(msz):
-            aa = all_a[m][start:end]
-            bb = all_b[m][start:end]
-            prompts.append(preprocess_batch(aa, bb))
-            tgt = ((aa + bb)[:, None] // POW10_11[None, :]) % 10
-            tgt_digits.append(tgt.to(torch.long))
-
-        prompt_t = torch.stack(prompts, dim=0).to(device)  # [M, B, PROMPT_LEN]
+        aa = torch.stack([all_a[m][start:end] for m in range(msz)], dim=0)  # [M, B]
+        bb = torch.stack([all_b[m][start:end] for m in range(msz)], dim=0)  # [M, B]
+        prompt_t = preprocess_batch(aa, bb).to(device)  # [M, B, PROMPT_LEN]
         gen = model.generate(prompt_t, max_new_tokens=TARGET_LEN)
         pred_digits = gen[:, :, -TARGET_LEN:-1].to("cpu")  # [M, B, SUM_DIGITS]
-        tgt = torch.stack(tgt_digits, dim=0)
+        tgt = (((aa + bb).unsqueeze(-1) // POW10_11.view(1, 1, -1)) % 10).to(torch.long)
 
         matches = pred_digits.eq(tgt)
         token_correct += matches.sum(dim=(1, 2))

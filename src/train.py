@@ -24,6 +24,8 @@ import torch
 
 from src.data import (
     INPUT_LEN,
+    MAX_OPERAND,
+    NUM_DIGITS,
     VOCAB_SIZE,
     build_holdout_splits,
     encode_batch,
@@ -90,6 +92,7 @@ class CurriculumBatchSampler:
         self.g = torch.Generator().manual_seed(seed)
         self.reserved_hashes = reserved_hashes
         self.phases = curriculum_phases
+        self.pow10 = torch.tensor([10 ** i for i in range(NUM_DIGITS + 1)], dtype=torch.int64)
         # Build cumulative step boundaries
         self.boundaries = []
         cum = 0
@@ -103,23 +106,53 @@ class CurriculumBatchSampler:
                 return self.phases[i][0], self.phases[i][1]
         return self.phases[-1][0], self.phases[-1][1]
 
-    def sample_batch(self, step: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def sample_operands(self, step: int) -> Tuple[torch.Tensor, torch.Tensor]:
         min_dig, max_dig = self._phase_for_step(step)
 
-        a = torch.zeros(self.batch_size, dtype=torch.int64)
-        b = torch.zeros(self.batch_size, dtype=torch.int64)
+        n_dig = torch.randint(
+            min_dig, max_dig + 1, (self.batch_size,),
+            generator=self.g, dtype=torch.int64,
+        )
+        a = torch.empty(self.batch_size, dtype=torch.int64)
+        b = torch.empty(self.batch_size, dtype=torch.int64)
+        for dig in range(min_dig, max_dig + 1):
+            mask = n_dig.eq(dig)
+            n = int(mask.sum().item())
+            if n == 0:
+                continue
+            max_val = int(self.pow10[dig].item())
+            a[mask] = torch.randint(0, max_val, (n,), generator=self.g, dtype=torch.int64)
+            b[mask] = torch.randint(0, max_val, (n,), generator=self.g, dtype=torch.int64)
 
-        for i in range(self.batch_size):
-            n_dig = int(torch.randint(min_dig, max_dig + 1, (1,), generator=self.g).item())
-            max_val = 10 ** n_dig
-            ai = int(torch.randint(0, max_val, (1,), generator=self.g, dtype=torch.int64).item())
-            bi = int(torch.randint(0, max_val, (1,), generator=self.g, dtype=torch.int64).item())
-            while pair_hash(ai, bi) in self.reserved_hashes:
-                ai = int(torch.randint(0, max_val, (1,), generator=self.g, dtype=torch.int64).item())
-                bi = int(torch.randint(0, max_val, (1,), generator=self.g, dtype=torch.int64).item())
-            a[i] = ai
-            b[i] = bi
+        # Holdout collisions are very rare, so only rejected entries are resampled.
+        if self.reserved_hashes:
+            while True:
+                hashes = a * MAX_OPERAND + b
+                invalid = torch.tensor(
+                    [int(h) in self.reserved_hashes for h in hashes.tolist()],
+                    dtype=torch.bool,
+                )
+                if not bool(invalid.any()):
+                    break
+                n_bad = int(invalid.sum().item())
+                bad_digits = n_dig[invalid]
+                for dig in bad_digits.unique(sorted=True).tolist():
+                    dig_mask = invalid & n_dig.eq(int(dig))
+                    n_dig_bad = int(dig_mask.sum().item())
+                    if n_dig_bad == 0:
+                        continue
+                    max_val = int(self.pow10[int(dig)].item())
+                    a[dig_mask] = torch.randint(
+                        0, max_val, (n_dig_bad,), generator=self.g, dtype=torch.int64
+                    )
+                    b[dig_mask] = torch.randint(
+                        0, max_val, (n_dig_bad,), generator=self.g, dtype=torch.int64
+                    )
 
+        return a, b
+
+    def sample_batch(self, step: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        a, b = self.sample_operands(step)
         return encode_batch(a, b)
 
 
@@ -371,15 +404,18 @@ def train(model_cfg: ModelConfig, train_cfg: TrainConfig) -> Dict:
     for step in range(train_cfg.train_steps):
         model.train()
 
-        x_batches: List[torch.Tensor] = []
-        y_batches: List[torch.Tensor] = []
+        a_batches: List[torch.Tensor] = []
+        b_batches: List[torch.Tensor] = []
         for sampler in samplers:
-            x_i, y_i = sampler.sample_batch(step)
-            x_batches.append(x_i)
-            y_batches.append(y_i)
+            a_i, b_i = sampler.sample_operands(step)
+            a_batches.append(a_i)
+            b_batches.append(b_i)
 
-        x = torch.stack(x_batches, dim=0).to(device)  # [M, B, T]
-        y = torch.stack(y_batches, dim=0).to(device)  # [M, B, T]
+        a = torch.stack(a_batches, dim=0)
+        b = torch.stack(b_batches, dim=0)
+        x, y = encode_batch(a, b)
+        x = x.to(device)  # [M, B, T]
+        y = y.to(device)  # [M, B, T]
 
         lr_now = cosine_lr(step, train_cfg.train_steps, train_cfg.lr,
                            train_cfg.warmup_steps, train_cfg.min_lr_ratio)
