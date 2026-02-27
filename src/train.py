@@ -7,7 +7,7 @@ Incorporates gpt-acc-jax techniques:
   - AdamW optimizer with gradient clipping
 
 Usage:
-  python -m src.train --run-name lowrank_pos3 --pos-rank 3
+  python -m src.train --run-name baseline_num8_default --device mps --seed 42
 """
 
 import argparse
@@ -634,7 +634,7 @@ def main() -> None:
     p = argparse.ArgumentParser(description="Train addition transformer")
 
     # run/output
-    p.add_argument("--run-name", type=str, default="lowrank_baseline")
+    p.add_argument("--run-name", type=str, default="baseline_num8_default")
     p.add_argument("--run-dir", type=Path, default=None)
     p.add_argument("--split-dir", type=Path, default=Path("results/data"))
     p.add_argument("--device", type=str, default="cpu")

@@ -85,11 +85,11 @@ uv run python -m src.eval predict \
 ### Train from Scratch
 
 ```bash
-# d=8 baseline (reliable on this repo/hardware)
+# Baseline (current default): 8 parallel models in one run
+# Baseline optimization defaults: batch_size=512, lr=0.015
 uv run python -m src.train \
-  --run-name baseline_d8_s42_30k \
-  --d-model 8 --d-ff 28 \
-  --train-steps 30000 --device cuda --seed 42
+  --run-name baseline_num8_default_s42_30k \
+  --train-steps 30000 --device mps --seed 42
 
 # Optional low-rank variant
 uv run python -m src.train \
@@ -102,7 +102,7 @@ uv run python -m src.train \
 ### Parallel Multi-Model Training
 
 ```bash
-# Train 3 independent models in one vectorized run (seeds: 42, 43, 44)
+# Example: train 3 independent models in one vectorized run (seeds: 42, 43, 44)
 uv run python -m src.train \
   --run-name parallel3_d8 \
   --num-models 3 \
@@ -119,6 +119,7 @@ Behavior:
   - ...
 - A root aggregate summary is written to `results/runs/<run_name>/summary.json`.
 - W&B logs one run per model (`<run_name>_model000`, etc.) grouped under `<run_name>`.
+- Current baseline success criterion: at least `4/8` models must reach `>99%` validation exact-match.
 
 ## Training
 

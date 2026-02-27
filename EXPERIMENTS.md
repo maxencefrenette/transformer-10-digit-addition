@@ -1167,3 +1167,126 @@ uv run python -m src.train \
     - `num_models=8`: `15.875s` (this run)
 - Conclusion:
   - On this short MPS benchmark, `num_models=8` maintained nearly flat wall-clock relative to `num_models=1`, indicating strong hardware utilization for vectorized parallel models in this setup.
+
+### Experiment E33: Baseline Run with Latest Multi-Model Defaults (`num_models=8`, 30k steps, base seed 42)
+- Goal:
+  - Run the current baseline end-to-end with all recent code changes and defaults.
+  - Validate against the current success standard (`>=4/8` models with `best_val_exact > 0.99`).
+- Command:
+```bash
+uv run python -m src.train \
+  --run-name baseline_num8_default_s42_30k \
+  --device mps --seed 42
+```
+- Outputs:
+  - `results/runs/baseline_num8_default_s42_30k/summary.json`
+  - `results/runs/baseline_num8_default_s42_30k/model_000/metrics.csv`
+  - `results/runs/baseline_num8_default_s42_30k/model_001/metrics.csv`
+  - `results/runs/baseline_num8_default_s42_30k/model_002/metrics.csv`
+  - `results/runs/baseline_num8_default_s42_30k/model_003/metrics.csv`
+  - `results/runs/baseline_num8_default_s42_30k/model_004/metrics.csv`
+  - `results/runs/baseline_num8_default_s42_30k/model_005/metrics.csv`
+  - `results/runs/baseline_num8_default_s42_30k/model_006/metrics.csv`
+  - `results/runs/baseline_num8_default_s42_30k/model_007/metrics.csv`
+- Findings:
+  - Runtime:
+    - `elapsed_sec = 1684.3319` (~28.1 min)
+  - Aggregate:
+    - `best_val_exact_mean = 0.4061`
+    - `best_val_exact_min = 0.0`
+    - `best_val_exact_max = 1.0`
+  - Per model (`model_index`, `seed`, `best_val_exact`, `best_step`):
+    - `0, 42, 0.1106, 15000`
+    - `1, 43, 0.9988, 29500`
+    - `2, 44, 0.1042, 12000`
+    - `3, 45, 0.0352, 17000`
+    - `4, 46, 0.0, 0`
+    - `5, 47, 1.0, 14000`
+    - `6, 48, 0.0, 0`
+    - `7, 49, 1.0, 25500`
+  - Models with `best_val_exact > 0.99`: `3 / 8`
+- Conclusion:
+  - Baseline run completed successfully, but **did not meet** current success criterion (`>=4/8` converged to `>99%`).
+
+### Experiment E34: Targeted Follow-up Sweep2 (3 configs, `num_models=8`, 30k steps, base seed 42)
+- Goal:
+  - Run the requested targeted follow-up configs sequentially and compare convergence count (`best_val_exact > 0.99`).
+- Command:
+```bash
+set -euo pipefail
+for spec in "384 0.0162" "384 0.0168" "448 0.0165"; do
+  bs=$(echo "$spec" | awk '{print $1}')
+  lr=$(echo "$spec" | awk '{print $2}')
+  lr_tag=${lr/./p}
+  run_name="sweep2_num8_bs${bs}_lr${lr_tag}_s42_30k"
+  echo "=== START ${run_name} ==="
+  uv run python -m src.train \
+    --run-name "${run_name}" \
+    --num-models 8 \
+    --batch-size "${bs}" \
+    --lr "${lr}" \
+    --train-steps 30000 \
+    --device mps \
+    --seed 42
+
+  uv run python - <<PY
+import json
+from pathlib import Path
+p = Path('results/runs') / '${run_name}' / 'summary.json'
+obj = json.loads(p.read_text())
+cnt = sum(1 for m in obj.get('models', []) if float(m.get('best_val_exact', 0.0)) > 0.99)
+print(f"SWEEP2_RESULT run={obj['run_name']} elapsed_sec={obj.get('elapsed_sec')} success_gt099={cnt}/8")
+PY
+done
+
+echo "=== SWEEP2 COMPLETE ==="
+```
+- Outputs:
+  - `results/runs/sweep2_num8_bs384_lr0p0162_s42_30k/summary.json`
+  - `results/runs/sweep2_num8_bs384_lr0p0168_s42_30k/summary.json`
+  - `results/runs/sweep2_num8_bs448_lr0p0165_s42_30k/summary.json`
+- Findings:
+  - `sweep2_num8_bs384_lr0p0162_s42_30k`: `elapsed_sec=1184.9450`, `best_val_exact > 0.99` = `2/8`
+  - `sweep2_num8_bs384_lr0p0168_s42_30k`: `elapsed_sec=1189.1019`, `best_val_exact > 0.99` = `2/8`
+  - `sweep2_num8_bs448_lr0p0165_s42_30k`: `elapsed_sec=1272.3717`, `best_val_exact > 0.99` = `2/8`
+- Conclusion:
+  - None of the three targeted follow-up configs met the success criterion (`>=4/8` models with `best_val_exact > 0.99`).
+
+### Experiment E35: Requested Batch Size / LR Sweep (`num_models=8`, 30k steps, base seed 42)
+- Goal:
+  - Sweep `batch_size ∈ {384, 512}` and `lr ∈ {0.0135, 0.0150, 0.0165}` to improve success rate from baseline `3/8`.
+- Command:
+```bash
+set -euo pipefail
+for bs in 384 512; do
+  for lr in 0.0135 0.0150 0.0165; do
+    lr_tag=${lr/./p}
+    run_name="sweep_num8_bs${bs}_lr${lr_tag}_s42_30k"
+    uv run python -m src.train \
+      --run-name "${run_name}" \
+      --num-models 8 \
+      --batch-size "${bs}" \
+      --lr "${lr}" \
+      --train-steps 30000 \
+      --device mps \
+      --seed 42
+  done
+done
+```
+- Outputs:
+  - `results/runs/sweep_num8_bs384_lr0p0135_s42_30k/summary.json`
+  - `results/runs/sweep_num8_bs384_lr0p0150_s42_30k/summary.json`
+  - `results/runs/sweep_num8_bs384_lr0p0165_s42_30k/summary.json`
+  - `results/runs/sweep_num8_bs512_lr0p0135_s42_30k/summary.json`
+  - `results/runs/sweep_num8_bs512_lr0p0150_s42_30k/summary.json`
+  - `results/runs/sweep_num8_bs512_lr0p0165_s42_30k/summary.json`
+- Findings:
+  - `sweep_num8_bs384_lr0p0135_s42_30k`: `elapsed_sec=1598.1071`, success `3/8`
+  - `sweep_num8_bs384_lr0p0150_s42_30k`: `elapsed_sec=1475.3998`, success `2/8`
+  - `sweep_num8_bs384_lr0p0165_s42_30k`: `elapsed_sec=1547.0577`, success `6/8`
+  - `sweep_num8_bs512_lr0p0135_s42_30k`: `elapsed_sec=1905.1928`, success `3/8`
+  - `sweep_num8_bs512_lr0p0150_s42_30k`: `elapsed_sec=2000.0991`, success `4/8`
+  - `sweep_num8_bs512_lr0p0165_s42_30k`: `elapsed_sec=1620.6442`, success `2/8`
+- Conclusion:
+  - Best configuration in the requested sweep: **`batch_size=384, lr=0.0165` with `6/8` success**, improving over baseline `3/8`.
+  - Secondary viable configuration: `batch_size=512, lr=0.0150` with `4/8`.

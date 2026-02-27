@@ -13,6 +13,11 @@
 
 ## Multi-Model Default
 - Use `num_models=8` by default unless explicitly overridden.
+- Treat this as the baseline configuration.
+
+## Baseline Hyperparameters
+- Baseline optimization defaults are `batch_size=512` and `lr=0.015`.
+- Keep these as the baseline unless explicitly experimenting with alternatives.
 
 ## Experiment Success Criterion
 - Standard success criterion: at least 4 of the 8 models must converge to `>99%` validation exact-match accuracy.
