@@ -9,7 +9,9 @@
 - Add the command, key outputs/paths, and findings after each run.
 
 ## Experiment Execution
-- Always run 3 seeds for every experiment by default.
+- Do not run separate multi-seed repeats by default.
+- Run each experiment as a single `num_models=8` training run.
+- Treat that one run as the 8-seed experiment result.
 
 ## Multi-Model Default
 - Use `num_models=8` by default unless explicitly overridden.

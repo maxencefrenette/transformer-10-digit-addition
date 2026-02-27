@@ -1459,3 +1459,120 @@ done
   - Compared with previous observed ~`33s` per 500-step window in this config family, this is a substantial speedup.
 - Conclusion:
   - Runtime optimization succeeded; 8-model experiments now complete markedly faster with unchanged model shape/parameter count.
+
+### Experiment E38: TODO Batch (Single `num_models=8` Run per Experiment)
+- Goal:
+  - Execute all experiments listed in `TODO.md` using one `num_models=8` run per experiment.
+  - Evaluate against TODO success rules relative to baseline reference:
+    - baseline reference run: `todo_baseline_ref_s42_30k`
+    - baseline metrics: `success_gt099=5/8`, `params_per_model=896`, `elapsed_sec=1132.235`
+  - Success checks applied:
+    1. Fewer params and `>50%` success (`>=5/8`).
+    2. Same params and higher success than baseline (`>5/8`).
+    3. Same params and same success as baseline (`5/8`) with lower wall-clock.
+- Commands:
+```bash
+# baseline reference used for comparison
+uv run python -m src.train \
+  --run-name todo_baseline_ref_s42_30k \
+  --run-dir results/runs/todo_baseline_ref_s42_30k \
+  --device mps --seed 42 --train-steps 30000 --num-models 8 --batch-size 512 --lr 0.015
+
+# Ablation of fixed_full_rank for mlp
+uv run python -m src.train \
+  --run-name todo_ablate_fixed_mlp_s42_30k \
+  --run-dir results/runs/todo_ablate_fixed_mlp_s42_30k \
+  --device mps --seed 42 --train-steps 30000 --num-models 8 --no-fixed-full-rank-mlp
+
+# Ablation of fixed_full_rank for attention (rerun after interruption)
+uv run python -m src.train \
+  --run-name todo_ablate_fixed_attn_s42_30k_rerun \
+  --run-dir results/runs/todo_ablate_fixed_attn_s42_30k_rerun \
+  --device mps --seed 42 --train-steps 30000 --num-models 8 --no-fixed-full-rank-attn
+
+# Lower rank for attention
+uv run python -m src.train \
+  --run-name todo_lowrank_attn_q3_o3_s42_30k \
+  --run-dir results/runs/todo_lowrank_attn_q3_o3_s42_30k \
+  --device mps --seed 42 --train-steps 30000 --num-models 8 --qkv-rank 3 --attn-out-rank 3
+
+# Run for more steps
+uv run python -m src.train \
+  --run-name todo_more_steps_s42_50k \
+  --run-dir results/runs/todo_more_steps_s42_50k \
+  --device mps --seed 42 --train-steps 50000 --num-models 8
+
+# Lower d_model to 7
+uv run python -m src.train \
+  --run-name todo_dmodel7_s42_30k \
+  --run-dir results/runs/todo_dmodel7_s42_30k \
+  --device mps --seed 42 --train-steps 30000 --num-models 8 --d-model 7
+
+# Lower ffn expansion to 2x equivalent at d_model=8
+uv run python -m src.train \
+  --run-name todo_ffexp2x_dff16_s42_30k \
+  --run-dir results/runs/todo_ffexp2x_dff16_s42_30k \
+  --device mps --seed 42 --train-steps 30000 --num-models 8 --d-ff 16
+
+# Larger weight decay with LR sweep
+uv run python -m src.train \
+  --run-name todo_wd005_lr0p015_s42_30k \
+  --run-dir results/runs/todo_wd005_lr0p015_s42_30k \
+  --device mps --seed 42 --train-steps 30000 --num-models 8 --weight-decay 0.05 --lr 0.015
+uv run python -m src.train \
+  --run-name todo_wd005_lr0p018_s42_30k \
+  --run-dir results/runs/todo_wd005_lr0p018_s42_30k \
+  --device mps --seed 42 --train-steps 30000 --num-models 8 --weight-decay 0.05 --lr 0.018
+uv run python -m src.train \
+  --run-name todo_wd005_lr0p021_s42_30k \
+  --run-dir results/runs/todo_wd005_lr0p021_s42_30k \
+  --device mps --seed 42 --train-steps 30000 --num-models 8 --weight-decay 0.05 --lr 0.021
+```
+- Outputs:
+  - `results/runs/todo_baseline_ref_s42_30k/summary.json`
+  - `results/runs/todo_ablate_fixed_mlp_s42_30k/summary.json`
+  - `results/runs/todo_ablate_fixed_attn_s42_30k_rerun/summary.json`
+  - `results/runs/todo_lowrank_attn_q3_o3_s42_30k/summary.json`
+  - `results/runs/todo_more_steps_s42_50k/summary.json`
+  - `results/runs/todo_dmodel7_s42_30k/summary.json`
+  - `results/runs/todo_ffexp2x_dff16_s42_30k/summary.json`
+  - `results/runs/todo_wd005_lr0p015_s42_30k/summary.json`
+  - `results/runs/todo_wd005_lr0p018_s42_30k/summary.json`
+  - `results/runs/todo_wd005_lr0p021_s42_30k/summary.json`
+- Findings:
+  - `todo_ablate_fixed_mlp_s42_30k`: `success=1/8`, `params=896`, `elapsed_sec=770.393` -> **Fail**
+  - `todo_ablate_fixed_attn_s42_30k_rerun`: `success=3/8`, `params=896`, `elapsed_sec=839.646` -> **Fail**
+  - `todo_lowrank_attn_q3_o3_s42_30k`: `success=0/8`, `params=784`, `elapsed_sec=1000.504` -> **Fail**
+  - `todo_more_steps_s42_50k`: `success=5/8`, `params=896`, `elapsed_sec=1935.829` -> **Fail** (no success gain, slower)
+  - `todo_dmodel7_s42_30k`: `success=0/8`, `params=777`, `elapsed_sec=837.817` -> **Fail**
+  - `todo_ffexp2x_dff16_s42_30k`: `success=4/8`, `params=824`, `elapsed_sec=800.781` -> **Fail** (`4/8` is not `>50%`)
+  - `todo_wd005_lr0p015_s42_30k`: `success=5/8`, `params=896`, `elapsed_sec=1375.145` -> **Fail** (same success, slower)
+  - `todo_wd005_lr0p018_s42_30k`: `success=4/8`, `params=896`, `elapsed_sec=1332.575` -> **Fail**
+  - `todo_wd005_lr0p021_s42_30k`: `success=5/8`, `params=896`, `elapsed_sec=1322.769` -> **Fail** (same success, slower)
+- Conclusion:
+  - No experiment in this batch met TODO success criteria.
+  - Baseline defaults are unchanged based on this batch.
+
+### Experiment E39: TODO Custom LR Schedule (Low-LR Tail) and Revert
+- Goal:
+  - Test a custom schedule that spends more time at low learning rate near training end.
+- Temporary code change:
+  - Added an optional schedule mode (`cosine_low_tail`) in `src/train.py`, ran experiment, then reverted the code after evaluation.
+- Command:
+```bash
+uv run python -m src.train \
+  --run-name todo_lr_schedule_lowtail03_s42_30k \
+  --run-dir results/runs/todo_lr_schedule_lowtail03_s42_30k \
+  --device mps --seed 42 \
+  --train-steps 30000 --num-models 8 \
+  --lr-schedule cosine_low_tail \
+  --low-lr-tail-ratio 0.3
+```
+- Outputs:
+  - `results/runs/todo_lr_schedule_lowtail03_s42_30k/summary.json`
+- Findings:
+  - `success=3/8`, `params=896`, `elapsed_sec=1375.892`
+  - Versus baseline reference (`5/8`, `1132.235s`), this is worse in both success and wall-clock.
+- Conclusion:
+  - **Fail** by TODO criteria.
+  - Temporary schedule code was reverted; baseline training code remains on the original cosine schedule.
